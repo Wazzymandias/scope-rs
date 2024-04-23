@@ -14,15 +14,13 @@ fn import_protobuf_schemas() -> Result<(), Box<dyn std::error::Error>> {
         proto_files.push(file_path);
     }
 
-    let proto_include_dirs = [
-        "proto/schemas/",
-    ];
+    let proto_include_dirs = ["proto/schemas/"];
 
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
-        .out_dir("src/")  // Output directory for generated Rust files
+        .out_dir("src/") // Output directory for generated Rust files
         .emit_rerun_if_changed(true)
         .compile(&proto_files, &proto_include_dirs)?;
 
