@@ -1,4 +1,4 @@
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::io::Write;
 use std::str::FromStr;
 
@@ -10,15 +10,6 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{Empty, HubInfoRequest};
-
-#[derive(Parser, Debug)]
-pub struct Command {
-    #[clap(flatten)]
-    base: BaseConfig,
-
-    #[command(subcommand)]
-    pub(crate) subcommand: Option<SubCommands>,
-}
 
 #[derive(Debug, Args)]
 struct BaseConfig {
@@ -32,6 +23,15 @@ struct BaseConfig {
 
     #[arg(long, default_value = "2283")]
     port: u16,
+}
+
+#[derive(Parser, Debug)]
+pub struct Command {
+    #[clap(flatten)]
+    base: BaseConfig,
+
+    #[command(subcommand)]
+    pub(crate) subcommand: Option<SubCommands>,
 }
 
 #[derive(Parser, Debug)]
@@ -71,6 +71,41 @@ pub struct PeersCommand {
     endpoint: String,
 }
 
+fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<Endpoint> {
+    let protocol = if base_config.https {
+        "https"
+    } else if base_config.http {
+        "http"
+    } else {
+        return Err(eyre!("Invalid protocol"));
+    };
+    let endpoint: String = format!("{}://{}:{}", protocol, endpoint, base_config.port);
+    if base_config.https {
+        let native_certs = load_native_certs().expect("could not load native certificates");
+        let mut combined_pem = Vec::new();
+        for cert in native_certs {
+            writeln!(&mut combined_pem, "-----BEGIN CERTIFICATE-----").unwrap();
+            writeln!(
+                &mut combined_pem,
+                "{}",
+                STANDARD.encode(&cert.to_vec())
+            )
+            .unwrap();
+            writeln!(&mut combined_pem, "-----END CERTIFICATE-----").unwrap();
+        }
+
+        let cert: Certificate = Certificate::from_pem(combined_pem);
+        let tls_config = ClientTlsConfig::new().ca_certificate(cert);
+        Ok(Endpoint::from_str(endpoint.as_str())
+            .unwrap()
+            .tls_config(tls_config)
+            .unwrap()
+        )
+    } else {
+        Ok(Endpoint::from_str(endpoint.as_str()).unwrap())
+    }
+}
+
 impl Command {
     pub fn execute(self) -> eyre::Result<()> {
         match &self.subcommand {
@@ -91,38 +126,7 @@ impl InfoCommand {
     pub fn execute(&self) -> eyre::Result<()> {
         let rt = Runtime::new().unwrap();
         let result = rt.block_on(async {
-            // get parent base config from Command of this subcommand
-            let protocol = if self.base.https {
-                "https"
-            } else if self.base.http {
-                "http"
-            } else {
-                return Err(eyre!("Invalid protocol"));
-            };
-            let endpoint: String = format!("{}://{}:{}", protocol, self.endpoint, self.base.port);
-
-            let tonic_endpoint = if self.base.https {
-                let native_certs = load_native_certs().expect("could not load native certificates");
-                let mut combined_pem = Vec::new();
-                for cert in native_certs {
-                    writeln!(&mut combined_pem, "-----BEGIN CERTIFICATE-----")?;
-                    writeln!(
-                        &mut combined_pem,
-                        "{}",
-                        base64::engine::general_purpose::STANDARD.encode(&cert.to_vec())
-                    )?;
-                    writeln!(&mut combined_pem, "-----END CERTIFICATE-----")?;
-                }
-
-                let cert = Certificate::from_pem(combined_pem);
-                let tls_config = ClientTlsConfig::new().ca_certificate(cert);
-                Endpoint::from_str(endpoint.as_str())
-                    .unwrap()
-                    .tls_config(tls_config)
-                    .unwrap()
-            } else {
-                Endpoint::from_str(endpoint.as_str()).unwrap()
-            };
+            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
             let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
             let request = tonic::Request::new(HubInfoRequest { db_stats: true });
             let response = client.get_info(request).await.unwrap();
