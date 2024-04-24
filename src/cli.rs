@@ -1,15 +1,19 @@
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Write;
 use std::str::FromStr;
 
+use crate::proto;
 use clap::{Args, CommandFactory, Parser};
 use eyre::eyre;
+use prost::{bytes, Message};
 use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+use crate::hub_diff::HubStateDiffer;
 
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{Empty, HubInfoRequest, TrieNodePrefix};
+use crate::sync_id::{SyncId, UnpackedSyncId};
 
 #[derive(Debug, Args)]
 struct BaseConfig {
@@ -100,12 +104,7 @@ fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<En
         let mut combined_pem = Vec::new();
         for cert in native_certs {
             writeln!(&mut combined_pem, "-----BEGIN CERTIFICATE-----").unwrap();
-            writeln!(
-                &mut combined_pem,
-                "{}",
-                STANDARD.encode(&cert.to_vec())
-            )
-            .unwrap();
+            writeln!(&mut combined_pem, "{}", STANDARD.encode(&cert.to_vec())).unwrap();
             writeln!(&mut combined_pem, "-----END CERTIFICATE-----").unwrap();
         }
 
@@ -114,8 +113,7 @@ fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<En
         Ok(Endpoint::from_str(endpoint.as_str())
             .unwrap()
             .tls_config(tls_config)
-            .unwrap()
-        )
+            .unwrap())
     } else {
         Ok(Endpoint::from_str(endpoint.as_str()).unwrap())
     }
@@ -159,7 +157,6 @@ impl InfoCommand {
 
 impl DiffCommand {
     pub fn execute(&self) -> eyre::Result<()> {
-        // first, get the latest state and info from the peer
         let source_config: BaseConfig = BaseConfig {
             http: self.source_http,
             https: self.source_https,
@@ -174,86 +171,11 @@ impl DiffCommand {
         let target_endpoint = load_endpoint(&target_config, &self.target_endpoint)?;
         let rt = Runtime::new().unwrap();
         let result = rt.block_on(async {
-            let mut source_client = HubServiceClient::connect(source_endpoint).await.unwrap();
-            let mut target_client = HubServiceClient::connect(target_endpoint).await.unwrap();
-
-            let source_peer_state_result = source_client
-                .get_sync_snapshot_by_prefix(tonic::Request::new(Default::default()))
-                .await
-                .unwrap();
-
-            let target_peer_state_result = target_client
-                .get_sync_snapshot_by_prefix(tonic::Request::new(Default::default()))
-                .await
-                .unwrap();
-
-            let source_peer_state = source_peer_state_result.into_inner();
-            let target_peer_state = target_peer_state_result.into_inner();
-
-            let str_source_peer_state = serde_json::to_string_pretty(&source_peer_state);
-            let str_target_peer_state = serde_json::to_string_pretty(&target_peer_state);
-
-            if str_source_peer_state.is_err() {
-                return Err(eyre!("{:?}", str_source_peer_state.err()));
-            }
-            if str_target_peer_state.is_err() {
-                return Err(eyre!("{:?}", str_target_peer_state.err()));
-            }
-
-            let source_metadata = source_client
-                .get_sync_metadata_by_prefix(tonic::Request::new(Default::default()))
-                .await
-                .unwrap()
-                .into_inner();
-            let target_metadata = target_client
-                .get_sync_metadata_by_prefix(tonic::Request::new(Default::default()))
-                .await
-                .unwrap()
-                .into_inner();
-            // pretty print metadata
-            let str_source_metadata = serde_json::to_string_pretty(&source_metadata);
-            let str_target_metadata = serde_json::to_string_pretty(&target_metadata);
-            if str_source_metadata.is_err() {
-                return Err(eyre!("{:?}", str_source_metadata.err()));
-            }
-            if str_target_metadata.is_err() {
-                return Err(eyre!("{:?}", str_target_metadata.err()));
-            }
-            println!("source_metadata: {}", str_source_metadata.unwrap());
-            println!("target_metadata: {}", str_target_metadata.unwrap());
-
-            if source_metadata.num_messages > target_metadata.num_messages {
-                println!("source has more messages than target, skipping diff comparison");
-                return Ok(());
-            }
-            let source_node = source_client
-                .get_sync_metadata_by_prefix(tonic::Request::new(
-                    TrieNodePrefix{
-                        prefix: target_metadata.clone().prefix
-                    }
-                ))
-                .await?;
-            let target_node = target_client
-                .get_sync_metadata_by_prefix(tonic::Request::new(
-                    TrieNodePrefix{
-                        prefix: target_metadata.prefix
-                    }
-                ))
-                .await?;
-            let str_source_node = serde_json::to_string_pretty(&source_node.into_inner());
-            let str_target_node = serde_json::to_string_pretty(&target_node.into_inner());
-            if str_source_node.is_err() {
-                return Err(eyre!("{:?}", str_source_node.err()));
-            }
-            if str_target_node.is_err() {
-                return Err(eyre!("{:?}", str_target_node.err()));
-            }
-            println!("source_node: {}", str_source_node.unwrap());
-            println!("target_node: {}", str_target_node.unwrap());
-
-
-            println!("source_peer_state: {}", str_source_peer_state.unwrap());
-            println!("target_peer_state: {}", str_target_peer_state.unwrap());
+            let source_client = HubServiceClient::connect(source_endpoint).await.unwrap();
+            let target_client = HubServiceClient::connect(target_endpoint).await.unwrap();
+            let state_differ = HubStateDiffer::new(source_client, target_client);
+            let result = state_differ._diff().await?;
+            println!("{:?}", result);
             Ok(())
         });
         result
