@@ -1,14 +1,38 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use crate::proto::hub_service_client::HubServiceClient;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use eyre::eyre;
 use tonic::transport::Channel;
-use crate::proto::{Message, TrieNodeMetadataResponse, TrieNodePrefix};
+
+use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
+use crate::proto::hub_service_client::HubServiceClient;
+use crate::sync_id::{SyncId, TIMESTAMP_LENGTH, UnpackedSyncId};
+
+const FARCASTER_EPOCH: u64 = 1609459200; // Seconds from UNIX_EPOCH to Jan 1, 2021
+
+fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
+    let timestamp = match &message.data {
+        Some(data) => {
+            // Directly use the timestamp from `data`
+            FARCASTER_EPOCH + data.timestamp as u64
+        }
+        None => {
+            // Extract and parse the timestamp from `data_bytes`
+            message.data_bytes.as_ref()
+                .and_then(|bytes| std::str::from_utf8(&bytes[0..10]).ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|t| FARCASTER_EPOCH + t)
+                .ok_or_else(|| eyre!("Failed to extract timestamp"))?
+        }
+    };
+    Ok(UNIX_EPOCH + Duration::from_secs(timestamp))
+}
 
 #[derive(Debug)]
 pub struct HubStateDiffer {
     client_a: HubServiceClient<Channel>,
     client_b: HubServiceClient<Channel>,
-    queue: VecDeque<(Rc<Option<TrieNodeMetadataResponse>>, Rc<TrieNodeMetadataResponse>)>
 }
 
 #[derive(Debug)]
@@ -59,178 +83,114 @@ impl NodeMetaData {
     }
 }
 
-// 1. get the latest state and info from the peer
-// 1.5 here we would use the latest sync snapshot state from both endpoints
-// to check if they match in terms of their root hashes, number of messages, etc
-// but for our purposes we want to drill down and see where they are different so we
-// will skip for now
-
-// 2. After we do the "top level" check on snapshot, we now get the metadata
-// used to enqueue the root node
-// 3. We now got the metadata, and enqueue using the root node prefix to drill into it
-// and get the metadata for the root node prefix
-// NOTE: this is a bit redundant because the metadata from previous step
-// already returns root node, but the Typescript code does it for consistency
-// and so the root node is treated as the other nodes to reduce code complexity
-// 4. check if our node is empty or if the target hub (which for now we assume is at
-// later state i.e. has more messages) has <= 1 num messages, because if it's zero,
-// there might have been a delete operation or something and we need to reach their
-// same level of consistent state
-// 5. Now we fetch the missing sync ids - note that in the actual implementation
-// we would just get all the IDs for both hubs since we are drilling into all their
-// differences which would be from the root node
-// We could then pretty print their trees in the CLI to show where they differ
-
-// 5.1 convert the missing sync id byte vectors into SyncId type
-// and then fetch the messages for each sync id
-
-
 impl HubStateDiffer {
     pub(crate) fn new(client_a: HubServiceClient<Channel>, client_b: HubServiceClient<Channel>) -> Self {
-        Self { client_a, client_b, queue: Default::default() }
+        Self { client_a, client_b }
     }
-    async fn process_queue(&mut self) -> eyre::Result<(Vec<Message>)> {
-        let mut differences = vec![];
-        while let Some((source_node_metadata, target_node_metadata)) = self.queue.pop_front() {
-            println!("Processing queue: \nsource: {:?}, \ntarget: {:?}\n", source_node_metadata, target_node_metadata);
-            // 3. We now got the metadata, and enqueue using the root node prefix to drill into it
-            // and get the metadata for the root node prefix
-            // NOTE: this is a bit redundant because the metadata from previous step
-            // already returns root node, but the Typescript code does it for consistency
-            // and so the root node is treated as the other nodes to reduce code complexity
 
-            if source_node_metadata.is_none()
-                || source_node_metadata.as_ref().as_ref().map_or(false, |s| s.num_messages == 0)
-                || target_node_metadata.num_messages <= 1 {
-                let target_missing_sync_ids = self.client_b
-                    .get_all_sync_ids_by_prefix(tonic::Request::new(TrieNodePrefix {
-                        prefix: target_node_metadata.prefix.clone(),
-                    }))
-                    .await?
-                    .into_inner();
-                // now get the messages
-                let target_messages = self.client_b
-                    .get_all_messages_by_sync_ids(tonic::Request::new(target_missing_sync_ids.clone()))
-                    .await?
-                    .into_inner();
+    async fn sync_ids(input_prefix: Vec<u8>, client: &mut HubServiceClient<Channel>) -> eyre::Result<SyncIds> {
+        let mut source_sync_ids: SyncIds = SyncIds{
+            sync_ids: vec![]
+        };
 
-                let source_messages = self.client_a
-                    .get_all_messages_by_sync_ids(tonic::Request::new(target_missing_sync_ids.clone()))
-                    .await?
-                    .into_inner();
-
-                for (i, target_message) in target_messages.messages.iter().enumerate() {
-                    let source_message = source_messages.messages.get(i);
-                    if source_message.is_none() {
-                        println!("Missing message: {:?} {:?}", target_message.clone().data.unwrap().r#type, target_message);
-                        differences.push(target_message.clone());
-                    }
+        async fn fetch_sync_ids(client: &mut HubServiceClient<Channel>, out: &mut SyncIds, prefix: Vec<u8>) -> eyre::Result<()> {
+            // Fetch sync ids
+            let result = client.get_all_sync_ids_by_prefix(tonic::Request::new(TrieNodePrefix {
+                prefix: prefix.clone(),
+            })).await;
+            match result {
+                Ok(sync_ids) => {
+                    out.sync_ids.extend(sync_ids.into_inner().sync_ids);
+                },
+                Err(e) => {
+                    return Err(eyre!("error fetching sync ids for prefix {:?}: {:?}", prefix, e))
                 }
-            } else {
-                println!("skiping for some reason : {:?} {:?}\n", source_node_metadata, target_node_metadata)
             }
+            Ok(())
+        }
+        let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
+        for i in 0..input_prefix.len() {
+            queue.push_back(vec![input_prefix[i]]);
+        }
 
-            // Recurse into the children to to schedule the next set of work. Note that we didn't after  the
-            // `getMessagesFromOtherNode` above. This is because even after we get messages from the other node,
-            // there still might be left over messages at this node (if, for eg., there are > 10k messages, and the
-            // other node only sent 1k messages).
-            for (target_child_char, target_child) in NodeMetaData::from_proto(target_node_metadata).children.iter() {
-                let source = NodeMetaData::from_proto(
-                    Rc::new(source_node_metadata
-                        .as_ref()
-                        .as_ref()
-                        .map_or(Default::default(), |s| s.clone())));
-                let source_node = source.children.get(target_child_char);
-                println!("\nEnqueueing: {:?} {:?}\n", source_node, target_child);
-                self.enqueue(
-                    source_node.map_or(Rc::new(None), |c| Rc::new(Some(c.to_proto())))
-                   ,
-                   Rc::new(target_child.to_proto())
-                )
+        let mut visited: HashSet<Vec<u8>> = HashSet::new();
+        while let(Some(prefix)) = queue.pop_front() {
+            if visited.contains(&prefix) {
+                continue;
+            }
+            visited.insert(prefix.clone());
+
+
+            if prefix.len() + 1 >= 4 {
+                continue;
+            }
+            for i in 0..input_prefix.len() {
+                let mut new_prefix = prefix.clone();
+                new_prefix.push(input_prefix[i]);
+                fetch_sync_ids(client, &mut source_sync_ids, new_prefix.clone()).await?;
+                queue.push_back(new_prefix);
             }
         }
-        Ok(differences)
-    }
-    fn enqueue(&mut self, source_node_metadata: Rc<Option<TrieNodeMetadataResponse>>, target_node_metadata: Rc<TrieNodeMetadataResponse>) {
-        self.queue.push_back((source_node_metadata, target_node_metadata));
-    }
 
-    pub async fn _diff(mut self) -> eyre::Result<Vec<Message>> {
+
+        Ok(source_sync_ids)
+    }
+    pub async fn _diff(mut self) -> eyre::Result<HashMap<u64, UnpackedSyncId>> {
         let source_client = &mut self.client_a;
         let target_client = &mut self.client_b;
 
-        let source_peer_state_result = source_client
+        let source_snap = source_client
             .get_sync_snapshot_by_prefix(tonic::Request::new(Default::default()))
-            .await
-            .unwrap();
-
-        let target_peer_state_result = target_client
+            .await?
+            .into_inner();
+        let target_snap = target_client
             .get_sync_snapshot_by_prefix(tonic::Request::new(Default::default()))
-            .await
-            .unwrap();
-
-        let source_peer_state = source_peer_state_result.into_inner();
-        let target_peer_state = target_peer_state_result.into_inner();
-        if source_peer_state.root_hash.eq(&target_peer_state.root_hash) {
-            println!("Root hashes match, no differences found");
-            return Ok(vec![]);
-        }
-
-        let target_metadata = target_client
-            .get_sync_metadata_by_prefix(tonic::Request::new(Default::default()))
-            .await
-            .unwrap()
+            .await?
             .into_inner();
 
-        let source_node = source_client
-            .get_sync_metadata_by_prefix(tonic::Request::new(TrieNodePrefix {
-                prefix: target_metadata.clone().prefix,
-            }))
-            .await?;
-        let target_node = target_client
-            .get_sync_metadata_by_prefix(tonic::Request::new(TrieNodePrefix {
-                prefix: target_metadata.clone().prefix,
-            }))
-            .await?;
+        let source_sync_ids: SyncIds = HubStateDiffer::sync_ids(source_snap.prefix, source_client).await?;
+        let target_sync_ids: SyncIds = HubStateDiffer::sync_ids(target_snap.prefix, target_client).await?;
 
-        let source_metadata = source_node.into_inner();
-        // 1.5 here we would use the latest sync snapshot state from both endpoints
-        // to check if they match in terms of their root hashes, number of messages, etc
-        // but for our purposes we want to drill down and see where they are different so we
-        // will skip for now
+        let source_set: HashSet<Vec<u8>> = source_sync_ids.sync_ids.into_iter().collect();
+        let mut message_vec: HashMap<u64, UnpackedSyncId> = HashMap::new();
+        let mut fname_vec: HashMap<u64,UnpackedSyncId> = HashMap::new();
+        let mut on_chain_event_vec: HashMap<u64, UnpackedSyncId> = HashMap::new();
 
-        // 2. After we do the "top level" check on snapshot, we now get the metadata
-        // used to enqueue the root node
-        {
-            self.enqueue(Rc::new(Some(source_metadata)), Rc::new(target_metadata));
-        }
+        target_sync_ids.sync_ids.iter().for_each(|sync_id| {
+            if !source_set.contains(sync_id) {
+                let id = SyncId(sync_id.clone());
+                let timestamp_bytes = id.0[0..TIMESTAMP_LENGTH].to_vec();
+                let ts_str = String::from_utf8(timestamp_bytes).unwrap();
+                let timestamp = ts_str.parse::<u64>().unwrap();
+                let result: UnpackedSyncId = SyncId::unpack(&id.0);
+                match result {
+                    UnpackedSyncId::Message { fid, primary_key, hash } => {
+                        message_vec.insert(timestamp, UnpackedSyncId::Message { fid, primary_key, hash });
+                    },
+                    UnpackedSyncId::FName { fid, name, padded } => {
+                        fname_vec.insert(timestamp, UnpackedSyncId::FName { fid, name, padded });
+                    },
+                    UnpackedSyncId::OnChainEvent { fid, event_type, block_number, log_index } => {
+                        on_chain_event_vec.insert(timestamp, UnpackedSyncId::OnChainEvent { fid, event_type, block_number, log_index });
+                    }
+                    _ => {
+                        println!("unknown sync id found: {:?}", sync_id);
+                        // Do nothing
+                    }
+                }
+            }
+        });
 
-        let mut differences: Vec<Message> = vec![];
-        {
-            differences.extend(self.process_queue().await?);
-        }
-
-        Ok(differences)
+        Ok(
+            message_vec.iter()
+                .chain(fname_vec.iter())
+                .chain(on_chain_event_vec.iter())
+                .map(|(k, v)| (*k, v.clone())) // Create owned versions of both keys and values
+                .collect() // Collect into a HashMap<u64, UnpackedSyncId>
+        )
     }
-    async fn diff(self) -> eyre::Result<()> {
-        // TODO: for now we don't focus on source to simplify the logic
-        // let source_metadata = source_client
-        //     .get_sync_metadata_by_prefix(tonic::Request::new(Default::default()))
-        //     .await
-        //     .unwrap()
-        //     .into_inner();
+}
 
-            // 5. Now we fetch the missing sync ids - note that in the actual implementation
-            // we would just get all the IDs for both hubs since we are drilling into all their
-            // differences which would be from the root node
-            // We could then pretty print their trees in the CLI to show where they differ
-
-            // 5.1 convert the missing sync id byte vectors into SyncId type
-            // and then fetch the messages for each sync id
-            // TODO: the SyncIds type is protobuf but the SyncId itself is not which
-            //   I guess is because of the bit packing needed to make it work
-            //   so we would need to convert the byte vectors into SyncId type
-
-            Ok(())
-        }
-    }
+fn farcaster_to_unix(timestamp: u64) -> u64 {
+    FARCASTER_EPOCH + timestamp
+}

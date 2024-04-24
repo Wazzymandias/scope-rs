@@ -1,19 +1,16 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Write;
 use std::str::FromStr;
 
-use crate::proto;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, CommandFactory, Parser};
 use eyre::eyre;
-use prost::{bytes, Message};
 use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
-use crate::hub_diff::HubStateDiffer;
 
+use crate::hub_diff::HubStateDiffer;
+use crate::proto::{Empty, HubInfoRequest, TrieNodeMetadataResponse, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{Empty, HubInfoRequest, TrieNodePrefix};
-use crate::sync_id::{SyncId, UnpackedSyncId};
 
 #[derive(Debug, Args)]
 struct BaseConfig {
@@ -43,6 +40,8 @@ pub enum SubCommands {
     Info(InfoCommand),
     Diff(DiffCommand),
     Peers(PeersCommand),
+    SyncMetadata(SyncMetadataCommand),
+    SyncSnapshot(SyncSnapshotCommand),
 }
 
 #[derive(Args, Debug)]
@@ -90,6 +89,54 @@ pub struct PeersCommand {
     endpoint: String,
 }
 
+#[derive(Args, Debug)]
+pub struct SyncMetadataCommand {
+    #[clap(flatten)]
+    base: BaseConfig,
+
+    #[arg(long)]
+    endpoint: String,
+
+    #[arg(long)]
+    sync_id: Option<String>,
+
+    /// Sets the prefix as a comma-separated string of bytes, e.g., --prefix 48,48,51
+    #[arg(long)]
+    prefix: Option<String>, // Use Option if prefix is optional
+}
+
+#[derive(Args, Debug)]
+pub struct SyncSnapshotCommand {
+    #[clap(flatten)]
+    base: BaseConfig,
+
+    #[arg(long)]
+    endpoint: String,
+
+    /// Sets the prefix as a comma-separated string of bytes, e.g., --prefix 48,48,51
+    #[arg(long)]
+    prefix: Option<String>, // Use Option if prefix is optional
+}
+
+// convert comma separated string into Vec<u8>
+fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::ParseIntError> {
+    match input {
+        None => {
+            return Ok(vec![]);
+        }
+        Some(input) => {
+            if input.is_empty() {
+                return Ok(vec![]);
+            } else {
+                input
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect()
+            }
+        }
+    }
+}
+
 fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<Endpoint> {
     let protocol = if base_config.https {
         "https"
@@ -126,8 +173,10 @@ impl Command {
                 SubCommands::Info(info) => info.execute()?,
                 SubCommands::Diff(diff) => diff.execute()?,
                 SubCommands::Peers(peers) => peers.execute()?,
+                SubCommands::SyncMetadata(sync_metadata) => sync_metadata.execute()?,
+                SubCommands::SyncSnapshot(sync_snapshot) => sync_snapshot.execute()?,
             },
-            None => {
+            _ => {
                 Command::command().print_help()?;
             }
         }
@@ -175,7 +224,8 @@ impl DiffCommand {
             let target_client = HubServiceClient::connect(target_endpoint).await.unwrap();
             let state_differ = HubStateDiffer::new(source_client, target_client);
             let result = state_differ._diff().await?;
-            println!("{:?}", result);
+            let output = serde_json::to_string_pretty(&result).map_err(|e| eyre!("{:?}", e))?;
+            println!("{}", output);
             Ok(())
         });
         result
@@ -190,6 +240,61 @@ impl PeersCommand {
             let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
             let request = tonic::Request::new(Empty {});
             let response = client.get_current_peers(request).await.unwrap();
+
+            let str_response = serde_json::to_string_pretty(&response.into_inner());
+            if str_response.is_err() {
+                return Err(eyre!("{:?}", str_response.err()));
+            }
+            println!("{}", str_response.unwrap());
+            Ok(())
+        });
+
+        result
+    }
+}
+
+impl SyncMetadataCommand {
+    pub fn execute(&self) -> eyre::Result<()> {
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+            let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
+            let prefix = parse_prefix(&self.prefix)?;
+
+            let response = client
+                .get_sync_metadata_by_prefix(tonic::Request::new(TrieNodePrefix {
+                    prefix
+                }))
+                .await
+                .unwrap();
+
+            let str_response = serde_json::to_string_pretty(&response.into_inner());
+            if str_response.is_err() {
+                return Err(eyre!("{:?}", str_response.err()));
+            }
+            println!("{}", str_response.unwrap());
+            println!("default: {}", serde_json::to_string_pretty(&TrieNodeMetadataResponse::default()).unwrap());
+            Ok(())
+        });
+
+        result
+    }
+}
+
+impl SyncSnapshotCommand {
+    pub fn execute(&self) -> eyre::Result<()> {
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+            let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
+            let prefix = parse_prefix(&self.prefix)?;
+
+            let response = client
+                .get_sync_snapshot_by_prefix(tonic::Request::new(TrieNodePrefix {
+                    prefix
+                }))
+                .await
+                .unwrap();
 
             let str_response = serde_json::to_string_pretty(&response.into_inner());
             if str_response.is_err() {
