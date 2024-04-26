@@ -1,7 +1,7 @@
 cargo-features = ["edition2024"]
 
 [package]
-name = "telescope-rs"
+name = "scope-rs"
 version = "0.1.0"
 edition = "2024"
 
@@ -21,6 +21,13 @@ eyre = { version = "0.6.12", default-features = true }
 clap = { version = "4.5.4", features = ["derive", "std"], default-features = true }
 rustls-native-certs = "0.7.0"
 base64 = { version = "0.22.0", default-features = false }
+slog = "2.7.0"
+slog-async = "2.8.0"
+slog-json = "2.6.1"
+slog-scope = "4.4.0"
+futures = "0.3.30"
+chrono = "0.4.38"
+histogram = "0.10.0"
 
 [profile.dev]
 incremental = true

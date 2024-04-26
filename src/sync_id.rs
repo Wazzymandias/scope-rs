@@ -1,5 +1,5 @@
-use std::convert::TryInto;
 use crate::proto::OnChainEventType;
+use std::convert::TryInto;
 
 // Given constants and types for the simulation
 pub const TIMESTAMP_LENGTH: usize = 10;
@@ -116,7 +116,6 @@ impl RootPrefix {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SyncIdType {
     Unknown = 0,
@@ -127,7 +126,9 @@ enum SyncIdType {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum UnpackedSyncId {
-    Unknown { fid: u32 },
+    Unknown {
+        fid: u32,
+    },
     Message {
         fid: u32,
         primary_key: Vec<u8>,
@@ -167,25 +168,33 @@ impl UnpackedSyncId {
                 let fid = 0; // Placeholder: Extract fid from bytes
                 let primary_key = vec![]; // Placeholder: Extract primary_key from bytes
                 let hash = vec![]; // Placeholder: Extract hash from bytes
-                UnpackedSyncId::Message { fid, primary_key, hash }
-            },
+                UnpackedSyncId::Message {
+                    fid,
+                    primary_key,
+                    hash,
+                }
+            }
             FName => {
                 let fid = 0; // Placeholder: Extract fid from bytes
                 let name = vec![]; // Placeholder: Extract name from bytes
                 let padded = true; // Placeholder: Determine if name is padded
                 UnpackedSyncId::FName { fid, name, padded }
-            },
+            }
             OnChainEvent => {
                 let fid = 0; // Placeholder: Extract fid from bytes
                 let event_type = OnChainEventType::EventTypeIdRegister; // Placeholder: Determine event type
                 let block_number = 0; // Placeholder: Extract block_number from bytes
                 let log_index = 0; // Placeholder: Extract log_index from bytes
-                UnpackedSyncId::OnChainEvent { fid, event_type, block_number, log_index }
-            },
+                UnpackedSyncId::OnChainEvent {
+                    fid,
+                    event_type,
+                    block_number,
+                    log_index,
+                }
+            }
         }
     }
 }
-
 
 pub struct SyncId(pub Vec<u8>);
 
@@ -195,8 +204,13 @@ impl SyncId {
         let root_prefix = sync_id[TIMESTAMP_LENGTH];
 
         match RootPrefix::from_u8(root_prefix) {
-            RootPrefix::User => { // Equivalent to SyncIdType::Message case in TypeScript
-                let fid = u32::from_be_bytes(sync_id[TIMESTAMP_LENGTH + 1..TIMESTAMP_LENGTH + 1 + FID_BYTES].try_into().unwrap());
+            RootPrefix::User => {
+                // Equivalent to SyncIdType::Message case in TypeScript
+                let fid = u32::from_be_bytes(
+                    sync_id[TIMESTAMP_LENGTH + 1..TIMESTAMP_LENGTH + 1 + FID_BYTES]
+                        .try_into()
+                        .unwrap(),
+                );
                 let hash_start = TIMESTAMP_LENGTH + 1 + FID_BYTES + 1; // Skipping timestamp, fid and set postfix
                 let hash = sync_id[hash_start..hash_start + HASH_LENGTH].to_vec();
                 let primary_key = sync_id[TIMESTAMP_LENGTH..].to_vec();
@@ -205,16 +219,25 @@ impl SyncId {
                     primary_key,
                     hash,
                 }
-            },
-            RootPrefix::FNameUserNameProof => { // Equivalent to SyncIdType::FName case in TypeScript
-                let fid = u32::from_be_bytes(sync_id[TIMESTAMP_LENGTH + 1..TIMESTAMP_LENGTH + 1 + FID_BYTES].try_into().unwrap());
+            }
+            RootPrefix::FNameUserNameProof => {
+                // Equivalent to SyncIdType::FName case in TypeScript
+                let fid = u32::from_be_bytes(
+                    sync_id[TIMESTAMP_LENGTH + 1..TIMESTAMP_LENGTH + 1 + FID_BYTES]
+                        .try_into()
+                        .unwrap(),
+                );
                 let name_bytes = &sync_id[TIMESTAMP_LENGTH + 1 + FID_BYTES..];
-                let first_zero_index = name_bytes.iter().position(|&x| x == 0).unwrap_or(name_bytes.len());
+                let first_zero_index = name_bytes
+                    .iter()
+                    .position(|&x| x == 0)
+                    .unwrap_or(name_bytes.len());
                 let name = name_bytes[..first_zero_index].to_vec();
                 let padded = first_zero_index != name_bytes.len();
                 UnpackedSyncId::FName { fid, name, padded }
-            },
-            RootPrefix::OnChainEvent => { // Equivalent to SyncIdType::OnChainEvent case in TypeScript
+            }
+            RootPrefix::OnChainEvent => {
+                // Equivalent to SyncIdType::OnChainEvent case in TypeScript
                 let event_type_byte = sync_id[TIMESTAMP_LENGTH + 1 + 1];
                 let event_type = match event_type_byte {
                     1 => OnChainEventType::EventTypeSigner,
@@ -224,11 +247,23 @@ impl SyncId {
                     _ => OnChainEventType::EventTypeNone,
                 };
 
-                let fid = u32::from_be_bytes(sync_id[TIMESTAMP_LENGTH + 1 + 1 + 1..TIMESTAMP_LENGTH + 1 + 1 + 1 + FID_BYTES].try_into().unwrap());
+                let fid = u32::from_be_bytes(
+                    sync_id[TIMESTAMP_LENGTH + 1 + 1 + 1..TIMESTAMP_LENGTH + 1 + 1 + 1 + FID_BYTES]
+                        .try_into()
+                        .unwrap(),
+                );
                 let block_number_start = TIMESTAMP_LENGTH + 1 + 1 + 1 + FID_BYTES;
-                let block_number = u32::from_be_bytes(sync_id[block_number_start..block_number_start + 4].try_into().unwrap());
+                let block_number = u32::from_be_bytes(
+                    sync_id[block_number_start..block_number_start + 4]
+                        .try_into()
+                        .unwrap(),
+                );
                 let log_index_start = block_number_start + 4; // Adjusted based on TypeScript logic
-                let log_index = u32::from_be_bytes(sync_id[log_index_start..log_index_start + 4].try_into().unwrap());
+                let log_index = u32::from_be_bytes(
+                    sync_id[log_index_start..log_index_start + 4]
+                        .try_into()
+                        .unwrap(),
+                );
 
                 UnpackedSyncId::OnChainEvent {
                     fid,
@@ -236,7 +271,7 @@ impl SyncId {
                     block_number,
                     log_index,
                 }
-            },
+            }
             _ => UnpackedSyncId::Unknown { fid: 0 },
         }
     }

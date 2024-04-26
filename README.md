@@ -1,9 +1,9 @@
-# telescope-rs
+# scope-rs
 
 > "We are part of a universe that is a work of art. We are the notes of the music of the spheres."
 > - Sol Weintraub, Hyperion
 
-`telescope-rs` is a command-line utility for searching and exploring [Hubs](https://docs.farcaster.xyz/learn/architecture/hubs) on the [Farcaster](https://www.farcaster.xyz/) protocol. 
+`scope-rs` is a command-line utility for searching and exploring [Hubs](https://docs.farcaster.xyz/learn/architecture/hubs) on the [Farcaster](https://www.farcaster.xyz/) protocol. 
 
 ## Build
 ```shell
@@ -12,7 +12,7 @@ cargo build --release
 
 ## Usage 
 ```shell
-Usage: telescope-rs [OPTIONS] [COMMAND]
+Usage: scope-rs [OPTIONS] [COMMAND]
 
 Commands:
   info

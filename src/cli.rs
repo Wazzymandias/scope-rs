@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::str::FromStr;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -8,11 +9,12 @@ use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
+use crate::farcaster::farcaster_to_unix;
 use crate::hub_diff::HubStateDiffer;
-use crate::proto::{Empty, HubInfoRequest, TrieNodeMetadataResponse, TrieNodePrefix};
+use crate::proto::{Empty, HubInfoRequest, Message, SyncIds, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 struct BaseConfig {
     #[arg(long)]
     #[arg(default_value = "true")]
@@ -42,6 +44,7 @@ pub enum SubCommands {
     Peers(PeersCommand),
     SyncMetadata(SyncMetadataCommand),
     SyncSnapshot(SyncSnapshotCommand),
+    Messages(MessagesCommand),
 }
 
 #[derive(Args, Debug)]
@@ -78,6 +81,27 @@ pub struct DiffCommand {
 
     #[arg(long, default_value = "true")]
     target_http: bool,
+
+    #[arg(long)]
+    event_type: Option<String>,
+
+    #[arg(long)]
+    since_hours: Option<u64>,
+
+    #[arg(long)]
+    exhaustive: Option<bool>,
+}
+
+#[derive(Args, Debug)]
+pub struct MessagesCommand {
+    #[clap(flatten)]
+    base: BaseConfig,
+
+    #[arg(long)]
+    endpoint: String,
+
+    #[arg(long)]
+    sync_id: Option<String>
 }
 
 #[derive(Args, Debug)]
@@ -128,10 +152,7 @@ fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::ParseIntErr
             if input.is_empty() {
                 return Ok(vec![]);
             } else {
-                input
-                    .split(',')
-                    .map(|s| s.trim().parse())
-                    .collect()
+                input.split(',').map(|s| s.trim().parse()).collect()
             }
         }
     }
@@ -167,13 +188,14 @@ fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<En
 }
 
 impl Command {
-    pub fn execute(self) -> eyre::Result<()> {
+    pub async fn execute(self) -> eyre::Result<()> {
         match &self.subcommand {
             Some(subcommand) => match subcommand {
-                SubCommands::Info(info) => info.execute()?,
-                SubCommands::Diff(diff) => diff.execute()?,
-                SubCommands::Peers(peers) => peers.execute()?,
-                SubCommands::SyncMetadata(sync_metadata) => sync_metadata.execute()?,
+                SubCommands::Info(info) => info.execute().await?,
+                SubCommands::Diff(diff) => diff.execute().await?,
+                SubCommands::Peers(peers) => peers.execute().await?,
+                SubCommands::Messages(messages) => messages.execute().await?,
+                SubCommands::SyncMetadata(sync_metadata) => sync_metadata.execute().await?,
                 SubCommands::SyncSnapshot(sync_snapshot) => sync_snapshot.execute()?,
             },
             _ => {
@@ -185,27 +207,26 @@ impl Command {
 }
 
 impl InfoCommand {
-    pub fn execute(&self) -> eyre::Result<()> {
-        let rt = Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
-            let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
-            let request = tonic::Request::new(HubInfoRequest { db_stats: true });
-            let response = client.get_info(request).await.unwrap();
+    pub async fn execute(&self) -> eyre::Result<()> {
+        let endpoint = self.endpoint.clone();
+        let base = self.base.clone();
 
-            let str_response = serde_json::to_string_pretty(&response.into_inner());
-            if str_response.is_err() {
-                return Err(eyre!("{:?}", str_response.err()));
-            }
-            println!("{}", str_response.unwrap());
-            Ok(())
-        });
-        result
+        let tonic_endpoint = load_endpoint(&base, &endpoint).or_else(|e| Err(eyre!("{:?}", e)))?;
+        let mut client = HubServiceClient::connect(tonic_endpoint).await?;
+        let request = tonic::Request::new(HubInfoRequest { db_stats: true });
+        let response = client.get_info(request).await?;
+
+        let str_response = serde_json::to_string_pretty(&response.into_inner());
+        if let Err(e) = str_response {
+            return Err(eyre!("{:?}", e));
+        }
+
+        Ok(println!("{}", str_response.unwrap()))
     }
 }
 
 impl DiffCommand {
-    pub fn execute(&self) -> eyre::Result<()> {
+    pub async fn execute(&self) -> eyre::Result<()> {
         let source_config: BaseConfig = BaseConfig {
             http: self.source_http,
             https: self.source_https,
@@ -218,66 +239,77 @@ impl DiffCommand {
         };
         let source_endpoint = load_endpoint(&source_config, &self.source_endpoint)?;
         let target_endpoint = load_endpoint(&target_config, &self.target_endpoint)?;
-        let rt = Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let source_client = HubServiceClient::connect(source_endpoint).await.unwrap();
-            let target_client = HubServiceClient::connect(target_endpoint).await.unwrap();
-            let state_differ = HubStateDiffer::new(source_client, target_client);
-            let result = state_differ._diff().await?;
-            let output = serde_json::to_string_pretty(&result).map_err(|e| eyre!("{:?}", e))?;
-            println!("{}", output);
-            Ok(())
-        });
-        result
+
+        let state_differ = HubStateDiffer::new(source_endpoint, target_endpoint);
+        let (source, target) = state_differ.diff_exhaustive().await.or_else(|e| Err(eyre!("{:?}", e)))?;
+        let output = serde_json::to_string_pretty(&(&source, &target)).or_else(|e| Err(eyre!("{:?}", e)))?;
+        let mut hist = histogram::Histogram::new(7, 64)?;
+        for message in target.iter() {
+            if !source.contains(message) {
+                slog_scope::info!("message not found in source: {:?}", message);
+                hist.increment(message.clone().data.unwrap().timestamp.clone() as u64)?;
+            }
+        }
+        println!("{:?}", histogram::SparseHistogram::from(&hist));
+        save_to_file(&(source, target), "messages1.json", "messages2.json").or_else(|e| Err(eyre!("{:?}", e)))?;
+        Ok(println!("{}", output))
+    }
+}
+
+impl MessagesCommand {
+    pub async fn execute(&self) -> eyre::Result<()> {
+        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+        let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
+        let prefix = parse_prefix(&self.sync_id)?;
+        let response = client
+            .get_all_messages_by_sync_ids(SyncIds { sync_ids: vec![prefix] }).await.unwrap();
+
+        let str_response = serde_json::to_string_pretty(&response.into_inner());
+        if str_response.is_err() {
+            return Err(eyre!("{:?}", str_response.err()));
+        }
+        println!("{}", str_response.unwrap());
+        Ok(())
     }
 }
 
 impl PeersCommand {
-    pub fn execute(&self) -> eyre::Result<()> {
-        let rt = Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
-            let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
-            let request = tonic::Request::new(Empty {});
-            let response = client.get_current_peers(request).await.unwrap();
+    pub async fn execute(&self) -> eyre::Result<()> {
+        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+        let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
+        let request = tonic::Request::new(Empty {});
+        let response = client.get_current_peers(request).await.unwrap();
 
-            let str_response = serde_json::to_string_pretty(&response.into_inner());
-            if str_response.is_err() {
-                return Err(eyre!("{:?}", str_response.err()));
-            }
-            println!("{}", str_response.unwrap());
-            Ok(())
-        });
-
-        result
+        let str_response = serde_json::to_string_pretty(&response.into_inner());
+        if str_response.is_err() {
+            return Err(eyre!("{:?}", str_response.err()));
+        }
+        println!("{}", str_response.unwrap());
+        Ok(())
     }
 }
 
 impl SyncMetadataCommand {
-    pub fn execute(&self) -> eyre::Result<()> {
-        let rt = Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
-            let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
-            let prefix = parse_prefix(&self.prefix)?;
+    pub async fn execute(&self) -> eyre::Result<()> {
+        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+        let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
+        let prefix = parse_prefix(&self.prefix)?;
 
-            let response = client
-                .get_sync_metadata_by_prefix(tonic::Request::new(TrieNodePrefix {
-                    prefix
-                }))
-                .await
-                .unwrap();
+        let response = client
+            .get_sync_metadata_by_prefix(tonic::Request::new(TrieNodePrefix { prefix }))
+            .await
+            .unwrap();
 
-            let str_response = serde_json::to_string_pretty(&response.into_inner());
-            if str_response.is_err() {
-                return Err(eyre!("{:?}", str_response.err()));
-            }
-            println!("{}", str_response.unwrap());
-            println!("default: {}", serde_json::to_string_pretty(&TrieNodeMetadataResponse::default()).unwrap());
-            Ok(())
-        });
+        let str_response = serde_json::to_string_pretty(&response.into_inner());
+        if str_response.is_err() {
+            return Err(eyre!("{:?}", str_response.err()));
+        }
 
-        result
+        Ok(println!("{}", str_response.unwrap()))
+        // println!(
+        //     "default: {}",
+        //     serde_json::to_string_pretty(&TrieNodeMetadataResponse::default()).unwrap()
+        // );
     }
 }
 
@@ -290,9 +322,7 @@ impl SyncSnapshotCommand {
             let prefix = parse_prefix(&self.prefix)?;
 
             let response = client
-                .get_sync_snapshot_by_prefix(tonic::Request::new(TrieNodePrefix {
-                    prefix
-                }))
+                .get_sync_snapshot_by_prefix(tonic::Request::new(TrieNodePrefix { prefix }))
                 .await
                 .unwrap();
 
@@ -306,4 +336,16 @@ impl SyncSnapshotCommand {
 
         result
     }
+}
+
+fn save_to_file(messages: &(Vec<Message>, Vec<Message>), first_path: &str, second_path: &str) -> eyre::Result<()> {
+    let file1 = File::create(first_path)?;
+    let (a, b) = messages;
+    let writer1 = BufWriter::new(file1);
+    serde_json::to_writer(writer1, a)?;
+
+    let file2 = File::create(second_path)?;
+    let writer2 = BufWriter::new(file2);
+    serde_json::to_writer(writer2, b)?;
+    Ok(())
 }
