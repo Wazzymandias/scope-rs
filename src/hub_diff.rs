@@ -1,21 +1,28 @@
+use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::Hash;
 use std::io::BufWriter;
 use std::rc::Rc;
-use std::sync::{Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use chrono::Utc;
 
-use eyre::{eyre};
+use crate::farcaster;
+use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LENGTH};
+use crate::farcaster::time::{
+    farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, FARCASTER_EPOCH,
+};
+use eyre::{eyre, Report};
 use histogram::Histogram;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{oneshot, watch, Notify};
+use tokio::time;
 use tonic::transport::{Channel, Endpoint};
-use crate::farcaster::time::{FARCASTER_EPOCH, farcaster_time_range, farcaster_time_to_str, farcaster_to_unix};
-use crate::farcaster::sync_id::{RootPrefix, SyncId, TIMESTAMP_LENGTH, UnpackedSyncId};
 
-use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
-
+use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
 
 fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
     let timestamp = match &message.data {
@@ -43,9 +50,7 @@ pub struct HubStateDiffer {
     endpoint_b: Endpoint,
 }
 
-struct HubState {
-
-}
+struct HubState {}
 
 #[derive(Debug)]
 struct NodeMetaData {
@@ -120,7 +125,10 @@ impl<T: Eq + Hash + Clone> UniqueQueue<T> {
 
     fn from(arr: Vec<T>) -> Self {
         let mut set = HashSet::new();
-        let queue = arr.into_iter().filter(|item| set.insert(item.clone())).collect();
+        let queue = arr
+            .into_iter()
+            .filter(|item| set.insert(item.clone()))
+            .collect();
         UniqueQueue { queue, set }
     }
 
@@ -165,13 +173,12 @@ impl<T: Eq + Hash + Clone> UniqueQueue<T> {
     }
 }
 
-
 impl HubStateDiffer {
-    pub(crate) fn new(
-        endpoint_a: Endpoint,
-        endpoint_b: Endpoint,
-    ) -> Self {
-        Self { endpoint_a, endpoint_b }
+    pub(crate) fn new(endpoint_a: Endpoint, endpoint_b: Endpoint) -> Self {
+        Self {
+            endpoint_a,
+            endpoint_b,
+        }
     }
 
     async fn sync_worker(
@@ -185,12 +192,18 @@ impl HubStateDiffer {
                 Some(p) => p,
                 None => break,
             };
-            let sync_ids = client.get_all_sync_ids_by_prefix(TrieNodePrefix{
-                prefix: prefix.clone(),
-            }).await?.into_inner();
-            let metadata = client.get_sync_metadata_by_prefix(TrieNodePrefix{
-                prefix: prefix.clone(),
-            }).await?.into_inner();
+            let sync_ids = client
+                .get_all_sync_ids_by_prefix(TrieNodePrefix {
+                    prefix: prefix.clone(),
+                })
+                .await?
+                .into_inner();
+            let metadata = client
+                .get_sync_metadata_by_prefix(TrieNodePrefix {
+                    prefix: prefix.clone(),
+                })
+                .await?
+                .into_inner();
 
             uniq.extend(sync_ids.sync_ids);
             for child in metadata.children.iter() {
@@ -203,8 +216,182 @@ impl HubStateDiffer {
         Ok(uniq)
     }
 
-    async fn watch(endpoint: Endpoint) {
+    async fn watch_worker(
+        active_count: Arc<AtomicUsize>,
+        endpoint: Endpoint,
+        queue: Arc<tokio::sync::RwLock<UniqueQueue<Vec<u8>>>>,
+        sender: Sender<SyncIds>,
+        done_channel: watch::Receiver<bool>,
+    ) -> eyre::Result<()> {
+        slog_scope::info!("starting watch worker",);
+        let mut client = HubServiceClient::connect(endpoint).await?;
 
+        loop {
+            let element = queue.write().await.pop_front();
+            let prefix = match element {
+                Some(p) => p,
+                None => {
+                    continue
+                }
+            };
+
+            println!("{:?}", prefix);
+            let sync_ids = client.get_all_sync_ids_by_prefix(TrieNodePrefix{
+                prefix: prefix.clone(),
+            }).await?.into_inner();
+
+            let metadata = client.get_sync_metadata_by_prefix(TrieNodePrefix{
+                prefix: prefix.clone(),
+            }).await?.into_inner();
+
+            for child in metadata.children.iter() {
+                if child.num_messages > 0 {
+                    active_count.fetch_add(1, Relaxed);
+                    queue.write().await.push_back(child.prefix.clone());
+                }
+            }
+
+            sender.send(sync_ids).await?;
+            active_count.fetch_sub(1, SeqCst);
+        }
+        Ok(())
+    }
+
+    pub async fn watch(a: Endpoint, b: Endpoint) -> eyre::Result<()> {
+        const BUFFER_SIZE: usize = 65536;
+        let mut a_syncid_set: HashSet<Vec<u8>> = HashSet::new();
+        let (a_tx, mut a_rx) = tokio::sync::mpsc::channel::<SyncIds>(BUFFER_SIZE);
+        let a_queue = Arc::new(tokio::sync::RwLock::new(UniqueQueue::new()));
+        let mut current_time = Utc::now().timestamp() as u64 - FARCASTER_EPOCH;
+        let prefix = farcaster_time_to_str(current_time as u32).as_bytes().to_vec();
+        a_queue
+            .write()
+            .await
+            .push_back(prefix.clone());
+        let a_active_count = Arc::new(AtomicUsize::new(1));
+
+        let mut b_syncid_set: HashSet<Vec<u8>> = HashSet::new();
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::channel::<SyncIds>(BUFFER_SIZE);
+        let (done_tx, done_rx) = watch::channel(false);
+        let b_queue = Arc::new(tokio::sync::RwLock::new(UniqueQueue::new()));
+        b_queue
+            .write()
+            .await
+            .push_back(prefix.clone());
+        let b_active_count = Arc::new(AtomicUsize::new(1));
+
+        let notifier: Arc<Notify> = Arc::new(Notify::new());
+
+        let mut done = done_rx.clone();
+        let acnt = a_active_count.clone();
+        let bcnt = b_active_count.clone();
+        let aq = a_queue.clone();
+        let bq = b_queue.clone();
+        let syncids_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    notice = notifier.notified() => {
+                        if a_rx.is_empty()
+                        && b_rx.is_empty()
+                        && acnt.load(SeqCst) == 0
+                        && bcnt.load(SeqCst) == 0 {
+                            for i in current_time - 1..current_time - 1 - 600 {
+                                if i < FARCASTER_EPOCH {
+                                    done.mark_changed();
+                                    break;
+                                }
+                                let prefix = farcaster_time_to_str(i as u32).as_bytes().to_vec();
+                                aq.write().await.push_back(prefix.clone());
+                                bq.write().await.push_back(prefix.clone());
+                            }
+                            current_time = current_time - 1 - 600;
+                        }
+                    }
+                    a_msg = a_rx.recv() => {
+                        match a_msg {
+                            Some(msg) => {
+                                a_syncid_set.extend(msg.sync_ids);
+                                notifier.notify_waiters();
+                            }
+                            _ => {}
+                        }
+                    }
+                    b_msg = b_rx.recv() => {
+                        match b_msg {
+                            Some(msg) => {
+                                b_syncid_set.extend(msg.sync_ids);
+                                notifier.notify_waiters();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        let worker_handlers = vec![
+            tokio::spawn(HubStateDiffer::watch_worker(
+                a_active_count.clone(),
+                a.clone(),
+                a_queue.clone(),
+                a_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                a_active_count.clone(),
+                a.clone(),
+                a_queue.clone(),
+                a_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                a_active_count.clone(),
+                a.clone(),
+                a_queue.clone(),
+                a_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                a_active_count.clone(),
+                a.clone(),
+                a_queue.clone(),
+                a_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                b_active_count.clone(),
+                b.clone(),
+                b_queue.clone(),
+                b_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                b_active_count.clone(),
+                b.clone(),
+                b_queue.clone(),
+                b_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                b_active_count.clone(),
+                b.clone(),
+                b_queue.clone(),
+                b_tx.clone(),
+                done_rx.clone(),
+            )),
+            tokio::spawn(HubStateDiffer::watch_worker(
+                b_active_count.clone(),
+                b.clone(),
+                b_queue.clone(),
+                b_tx.clone(),
+                done_rx.clone(),
+            )),
+        ];
+
+        let result = futures::future::join_all(worker_handlers).await;
+        tokio::join!(syncids_handle);
+
+        Ok(())
     }
 
     async fn sync_ids_exhaustive(
@@ -213,7 +400,7 @@ impl HubStateDiffer {
     ) -> eyre::Result<SyncIds> {
         const WORKER_POOL_SIZE: usize = 4;
         let mut unique_sync_ids = HashSet::new();
-        let queue= Arc::new(tokio::sync::RwLock::new(UniqueQueue::new()));
+        let queue = Arc::new(tokio::sync::RwLock::new(UniqueQueue::new()));
 
         for t in farcaster_time_range(Utc::now() - Duration::from_hours(12), Utc::now()) {
             let mut prefix = farcaster_time_to_str(t).as_bytes().to_vec();
@@ -235,11 +422,11 @@ impl HubStateDiffer {
                     // `sync_ids` is of type `HashSet<Vec<u8>>` here, coming from the spawned task.
                     slog_scope::info!("Task completed successfully: {:?}", sync_ids.len());
                     unique_sync_ids.extend(sync_ids);
-                }, // The task completed successfully.
+                } // The task completed successfully.
                 Ok(Err(e)) => {
                     // `e` is of type `ErrReport` here, coming from the spawned task.
                     slog_scope::error!("Task error: {:?}", e);
-                },
+                }
                 Err(e) => {
                     // `e` is of type `JoinError` here, indicating the task could not be joined.
                     // This usually means the task panicked or was cancelled.
@@ -256,7 +443,7 @@ impl HubStateDiffer {
     // diff exhaustive will do a full scan of two hub tries
     // to return all the messages that are missing
     // since it is expensive, we should take the result and persist it to a file as well
-    pub async fn diff_exhaustive(self) -> eyre::Result<(Vec<Message>,Vec<Message>)> {
+    pub async fn diff_exhaustive(self) -> eyre::Result<(Vec<Message>, Vec<Message>)> {
         let (source_sync_ids, target_sync_ids) = tokio::join!(
             HubStateDiffer::sync_ids_exhaustive(self.endpoint_a.clone(), vec![]),
             HubStateDiffer::sync_ids_exhaustive(self.endpoint_b.clone(), vec![]),
@@ -270,9 +457,8 @@ impl HubStateDiffer {
         let target: SyncIds;
         match target_sync_ids {
             Ok(s) => target = s,
-            Err(e) => return Err(eyre!("error fetching target sync ids: {:?}", e))
+            Err(e) => return Err(eyre!("error fetching target sync ids: {:?}", e)),
         }
-
 
         save_to_file(&source, "source_sync_ids.json")?;
         save_to_file(&target, "target_sync_ids.json")?;
@@ -294,17 +480,25 @@ impl HubStateDiffer {
         let pct = hist.percentiles(&[50.0, 90.0, 99.0, 99.9, 99.99, 99.999, 99.9999])?;
         slog_scope::info!("histogram: {:?}", sparse);
         slog_scope::info!("percentiles: {:?}", pct);
-        let source_messages = HubStateDiffer::messages_by_sync_ids(self.endpoint_a.clone(), source).await?;
-        let target_messages = HubStateDiffer::messages_by_sync_ids(self.endpoint_b.clone(), target).await?;
+        let source_messages =
+            HubStateDiffer::messages_by_sync_ids(self.endpoint_a.clone(), source).await?;
+        let target_messages =
+            HubStateDiffer::messages_by_sync_ids(self.endpoint_b.clone(), target).await?;
         slog_scope::info!("source messages: {:?}", source_messages.len());
         slog_scope::info!("target messages: {:?}", target_messages.len());
 
         Ok((source_messages, target_messages))
     }
 
-    async fn messages_by_sync_ids(endpoint: Endpoint, sync_ids: SyncIds) -> eyre::Result<Vec<Message>> {
+    async fn messages_by_sync_ids(
+        endpoint: Endpoint,
+        sync_ids: SyncIds,
+    ) -> eyre::Result<Vec<Message>> {
         let mut client = HubServiceClient::connect(endpoint).await?;
-        let ids = client.get_all_messages_by_sync_ids(sync_ids).await?.into_inner();
+        let ids = client
+            .get_all_messages_by_sync_ids(sync_ids)
+            .await?
+            .into_inner();
         Ok(ids.messages)
     }
 

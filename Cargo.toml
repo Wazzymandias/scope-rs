@@ -28,7 +28,7 @@ slog-scope = "4.4.0"
 futures = "0.3.30"
 chrono = "0.4.38"
 histogram = "0.10.0"
-duckdb = { version = "0.10.2", features = ["bundled"] }
+sled = "0.34.7"
 
 [profile.dev]
 incremental = true

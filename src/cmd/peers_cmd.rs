@@ -1,8 +1,8 @@
+use crate::cmd::cmd::{load_endpoint, BaseConfig};
+use crate::proto::hub_service_client::HubServiceClient;
+use crate::proto::Empty;
 use clap::Args;
 use eyre::eyre;
-use crate::cmd::cmd::{BaseConfig, load_endpoint};
-use crate::proto::Empty;
-use crate::proto::hub_service_client::HubServiceClient;
 
 #[derive(Args, Debug)]
 pub struct PeersCommand {

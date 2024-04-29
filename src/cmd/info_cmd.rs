@@ -1,7 +1,7 @@
-use clap::Args;
-use eyre::eyre;
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::HubInfoRequest;
+use clap::Args;
+use eyre::eyre;
 
 #[derive(Args, Debug)]
 pub struct InfoCommand {
@@ -17,7 +17,8 @@ impl InfoCommand {
         let endpoint = self.endpoint.clone();
         let base = self.base.clone();
 
-        let tonic_endpoint = crate::cmd::cmd::load_endpoint(&base, &endpoint).or_else(|e| Err(eyre!("{:?}", e)))?;
+        let tonic_endpoint =
+            crate::cmd::cmd::load_endpoint(&base, &endpoint).or_else(|e| Err(eyre!("{:?}", e)))?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await?;
         let request = tonic::Request::new(HubInfoRequest { db_stats: true });
         let response = client.get_info(request).await?;
@@ -30,4 +31,3 @@ impl InfoCommand {
         Ok(println!("{}", str_response.unwrap()))
     }
 }
-

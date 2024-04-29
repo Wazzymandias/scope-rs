@@ -1,12 +1,14 @@
 use chrono::Utc;
 
-
 pub const FARCASTER_EPOCH: u64 = 1609459200; // Seconds from UNIX_EPOCH to Jan 1, 2021
 pub fn farcaster_to_unix(timestamp: u64) -> u64 {
     FARCASTER_EPOCH + timestamp
 }
 
-pub fn farcaster_time_range(start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>) -> impl Iterator<Item = u32> {
+pub fn farcaster_time_range(
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> impl Iterator<Item = u32> {
     let start = start.timestamp() as u32 - (FARCASTER_EPOCH) as u32;
     let end = end.timestamp() as u32 - (FARCASTER_EPOCH) as u32;
     (start..end).step_by(1)
@@ -23,8 +25,8 @@ pub fn str_bytes_to_unix_time(timestamp: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_farcaster_to_unix() {
@@ -35,8 +37,8 @@ mod tests {
 
     #[test]
     fn test_farcaster_time_range() {
-        let start = Utc.with_ymd_and_hms(2021, 1, 1,0, 0, 0);
-        let end = Utc.with_ymd_and_hms(2021, 1, 1,0, 0, 2);
+        let start = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0);
+        let end = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 2);
         let range: Vec<u32> = farcaster_time_range(start.unwrap(), end.unwrap()).collect();
         assert_eq!(range, vec![0, 1]);
     }

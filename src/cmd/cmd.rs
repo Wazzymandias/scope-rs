@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::str::FromStr;
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::{Args, CommandFactory, Parser};
 use eyre::eyre;
 use rustls_native_certs::load_native_certs;
@@ -14,8 +14,8 @@ use crate::cmd::info_cmd::InfoCommand;
 use crate::cmd::messages_cmd::MessagesCommand;
 use crate::cmd::parse_cmd::ParseCommand;
 use crate::cmd::peers_cmd::PeersCommand;
-use crate::proto::{Message, SyncIds, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
+use crate::proto::{Message, SyncIds, TrieNodePrefix};
 
 #[derive(Debug, Args, Clone)]
 pub(crate) struct BaseConfig {
@@ -50,8 +50,6 @@ pub enum SubCommands {
     Messages(MessagesCommand),
     Parse(ParseCommand),
 }
-
-
 
 #[derive(Args, Debug)]
 pub struct SyncMetadataCommand {
@@ -196,7 +194,11 @@ impl SyncSnapshotCommand {
     }
 }
 
-pub(crate) fn save_to_file(messages: &(Vec<Message>, Vec<Message>), first_path: &str, second_path: &str) -> eyre::Result<()> {
+pub(crate) fn save_to_file(
+    messages: &(Vec<Message>, Vec<Message>),
+    first_path: &str,
+    second_path: &str,
+) -> eyre::Result<()> {
     let file1 = File::create(first_path)?;
     let (a, b) = messages;
     let writer1 = BufWriter::new(file1);

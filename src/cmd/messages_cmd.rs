@@ -1,8 +1,8 @@
-use clap::Args;
-use eyre::eyre;
-use crate::cmd::cmd::{BaseConfig, load_endpoint};
+use crate::cmd::cmd::{load_endpoint, BaseConfig};
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::SyncIds;
+use clap::Args;
+use eyre::eyre;
 
 #[derive(Args, Debug)]
 pub struct MessagesCommand {
@@ -13,7 +13,7 @@ pub struct MessagesCommand {
     endpoint: String,
 
     #[arg(long)]
-    sync_id: Option<String>
+    sync_id: Option<String>,
 }
 
 impl MessagesCommand {
@@ -22,7 +22,11 @@ impl MessagesCommand {
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let prefix = crate::cmd::cmd::parse_prefix(&self.sync_id)?;
         let response = client
-            .get_all_messages_by_sync_ids(SyncIds { sync_ids: vec![prefix] }).await.unwrap();
+            .get_all_messages_by_sync_ids(SyncIds {
+                sync_ids: vec![prefix],
+            })
+            .await
+            .unwrap();
 
         let str_response = serde_json::to_string_pretty(&response.into_inner());
         if str_response.is_err() {
