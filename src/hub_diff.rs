@@ -3,20 +3,18 @@ use std::fs::File;
 use std::hash::Hash;
 use std::io::BufWriter;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::Utc;
 
-use eyre::{Error, eyre};
+use eyre::{eyre};
 use histogram::Histogram;
-use slog::slog_info;
-use tokio::sync::{Mutex, Semaphore};
 use tonic::transport::{Channel, Endpoint};
-use crate::farcaster::{FARCASTER_EPOCH, farcaster_time_range, farcaster_time_to_str, farcaster_to_unix};
+use crate::farcaster::time::{FARCASTER_EPOCH, farcaster_time_range, farcaster_time_to_str, farcaster_to_unix};
+use crate::farcaster::sync_id::{RootPrefix, SyncId, TIMESTAMP_LENGTH, UnpackedSyncId};
 
 use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::sync_id::{RootPrefix, SyncId, TIMESTAMP_LENGTH, UnpackedSyncId};
 
 
 fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
@@ -43,6 +41,10 @@ fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
 pub struct HubStateDiffer {
     endpoint_a: Endpoint,
     endpoint_b: Endpoint,
+}
+
+struct HubState {
+
 }
 
 #[derive(Debug)]
@@ -201,6 +203,10 @@ impl HubStateDiffer {
         Ok(uniq)
     }
 
+    async fn watch(endpoint: Endpoint) {
+
+    }
+
     async fn sync_ids_exhaustive(
         endpoint: Endpoint,
         input_prefix: Vec<u8>,
@@ -339,7 +345,7 @@ impl HubStateDiffer {
         }
 
         let mut visited: HashSet<Vec<u8>> = HashSet::new();
-        while let (Some(prefix)) = queue.pop_front() {
+        while let Some(prefix) = queue.pop_front() {
             if visited.contains(&prefix) {
                 continue;
             }
@@ -358,7 +364,7 @@ impl HubStateDiffer {
 
         Ok(source_sync_ids)
     }
-    pub async fn _diff(mut self) -> eyre::Result<HashMap<u64, UnpackedSyncId>> {
+    pub async fn _diff(self) -> eyre::Result<HashMap<u64, UnpackedSyncId>> {
         let source_client = &mut HubServiceClient::connect(self.endpoint_a).await?;
         let target_client = &mut HubServiceClient::connect(self.endpoint_b).await?;
 

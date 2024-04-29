@@ -9,23 +9,26 @@ use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
-use crate::farcaster::farcaster_to_unix;
-use crate::hub_diff::HubStateDiffer;
-use crate::proto::{Empty, HubInfoRequest, Message, SyncIds, TrieNodePrefix};
+use crate::cmd::diff_cmd::DiffCommand;
+use crate::cmd::info_cmd::InfoCommand;
+use crate::cmd::messages_cmd::MessagesCommand;
+use crate::cmd::parse_cmd::ParseCommand;
+use crate::cmd::peers_cmd::PeersCommand;
+use crate::proto::{Message, SyncIds, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
 
 #[derive(Debug, Args, Clone)]
-struct BaseConfig {
+pub(crate) struct BaseConfig {
     #[arg(long)]
     #[arg(default_value = "true")]
-    http: bool,
+    pub(crate) http: bool,
 
     #[arg(long)]
     #[arg(default_value = "false")]
-    https: bool,
+    pub(crate) https: bool,
 
     #[arg(long, default_value = "2283")]
-    port: u16,
+    pub(crate) port: u16,
 }
 
 #[derive(Parser, Debug)]
@@ -45,73 +48,10 @@ pub enum SubCommands {
     SyncMetadata(SyncMetadataCommand),
     SyncSnapshot(SyncSnapshotCommand),
     Messages(MessagesCommand),
+    Parse(ParseCommand),
 }
 
-#[derive(Args, Debug)]
-pub struct InfoCommand {
-    #[clap(flatten)]
-    base: BaseConfig,
 
-    #[arg(long)]
-    endpoint: String,
-}
-
-#[derive(Args, Debug)]
-pub struct DiffCommand {
-    #[arg(long)]
-    source_endpoint: String,
-
-    #[arg(long, default_value = "2283")]
-    source_port: u16,
-
-    #[arg(long, default_value = "false")]
-    source_https: bool,
-
-    #[arg(long, default_value = "true")]
-    source_http: bool,
-
-    #[arg(long)]
-    target_endpoint: String,
-
-    #[arg(long, default_value = "2283")]
-    target_port: u16,
-
-    #[arg(long, default_value = "false")]
-    target_https: bool,
-
-    #[arg(long, default_value = "true")]
-    target_http: bool,
-
-    #[arg(long)]
-    event_type: Option<String>,
-
-    #[arg(long)]
-    since_hours: Option<u64>,
-
-    #[arg(long)]
-    exhaustive: Option<bool>,
-}
-
-#[derive(Args, Debug)]
-pub struct MessagesCommand {
-    #[clap(flatten)]
-    base: BaseConfig,
-
-    #[arg(long)]
-    endpoint: String,
-
-    #[arg(long)]
-    sync_id: Option<String>
-}
-
-#[derive(Args, Debug)]
-pub struct PeersCommand {
-    #[clap(flatten)]
-    base: BaseConfig,
-
-    #[arg(long)]
-    endpoint: String,
-}
 
 #[derive(Args, Debug)]
 pub struct SyncMetadataCommand {
@@ -143,7 +83,7 @@ pub struct SyncSnapshotCommand {
 }
 
 // convert comma separated string into Vec<u8>
-fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::ParseIntError> {
+pub(crate) fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::ParseIntError> {
     match input {
         None => {
             return Ok(vec![]);
@@ -158,7 +98,7 @@ fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::ParseIntErr
     }
 }
 
-fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<Endpoint> {
+pub(crate) fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<Endpoint> {
     let protocol = if base_config.https {
         "https"
     } else if base_config.http {
@@ -193,8 +133,9 @@ impl Command {
             Some(subcommand) => match subcommand {
                 SubCommands::Info(info) => info.execute().await?,
                 SubCommands::Diff(diff) => diff.execute().await?,
-                SubCommands::Peers(peers) => peers.execute().await?,
                 SubCommands::Messages(messages) => messages.execute().await?,
+                SubCommands::Parse(parse) => parse.execute()?,
+                SubCommands::Peers(peers) => peers.execute().await?,
                 SubCommands::SyncMetadata(sync_metadata) => sync_metadata.execute().await?,
                 SubCommands::SyncSnapshot(sync_snapshot) => sync_snapshot.execute()?,
             },
@@ -202,89 +143,6 @@ impl Command {
                 Command::command().print_help()?;
             }
         }
-        Ok(())
-    }
-}
-
-impl InfoCommand {
-    pub async fn execute(&self) -> eyre::Result<()> {
-        let endpoint = self.endpoint.clone();
-        let base = self.base.clone();
-
-        let tonic_endpoint = load_endpoint(&base, &endpoint).or_else(|e| Err(eyre!("{:?}", e)))?;
-        let mut client = HubServiceClient::connect(tonic_endpoint).await?;
-        let request = tonic::Request::new(HubInfoRequest { db_stats: true });
-        let response = client.get_info(request).await?;
-
-        let str_response = serde_json::to_string_pretty(&response.into_inner());
-        if let Err(e) = str_response {
-            return Err(eyre!("{:?}", e));
-        }
-
-        Ok(println!("{}", str_response.unwrap()))
-    }
-}
-
-impl DiffCommand {
-    pub async fn execute(&self) -> eyre::Result<()> {
-        let source_config: BaseConfig = BaseConfig {
-            http: self.source_http,
-            https: self.source_https,
-            port: self.source_port,
-        };
-        let target_config: BaseConfig = BaseConfig {
-            http: self.target_http,
-            https: self.target_https,
-            port: self.target_port,
-        };
-        let source_endpoint = load_endpoint(&source_config, &self.source_endpoint)?;
-        let target_endpoint = load_endpoint(&target_config, &self.target_endpoint)?;
-
-        let state_differ = HubStateDiffer::new(source_endpoint, target_endpoint);
-        let (source, target) = state_differ.diff_exhaustive().await.or_else(|e| Err(eyre!("{:?}", e)))?;
-        let output = serde_json::to_string_pretty(&(&source, &target)).or_else(|e| Err(eyre!("{:?}", e)))?;
-        let mut hist = histogram::Histogram::new(7, 64)?;
-        for message in target.iter() {
-            if !source.contains(message) {
-                slog_scope::info!("message not found in source: {:?}", message);
-                hist.increment(message.clone().data.unwrap().timestamp.clone() as u64)?;
-            }
-        }
-        println!("{:?}", histogram::SparseHistogram::from(&hist));
-        save_to_file(&(source, target), "messages1.json", "messages2.json").or_else(|e| Err(eyre!("{:?}", e)))?;
-        Ok(println!("{}", output))
-    }
-}
-
-impl MessagesCommand {
-    pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
-        let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
-        let prefix = parse_prefix(&self.sync_id)?;
-        let response = client
-            .get_all_messages_by_sync_ids(SyncIds { sync_ids: vec![prefix] }).await.unwrap();
-
-        let str_response = serde_json::to_string_pretty(&response.into_inner());
-        if str_response.is_err() {
-            return Err(eyre!("{:?}", str_response.err()));
-        }
-        println!("{}", str_response.unwrap());
-        Ok(())
-    }
-}
-
-impl PeersCommand {
-    pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
-        let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
-        let request = tonic::Request::new(Empty {});
-        let response = client.get_current_peers(request).await.unwrap();
-
-        let str_response = serde_json::to_string_pretty(&response.into_inner());
-        if str_response.is_err() {
-            return Err(eyre!("{:?}", str_response.err()));
-        }
-        println!("{}", str_response.unwrap());
         Ok(())
     }
 }
@@ -338,7 +196,7 @@ impl SyncSnapshotCommand {
     }
 }
 
-fn save_to_file(messages: &(Vec<Message>, Vec<Message>), first_path: &str, second_path: &str) -> eyre::Result<()> {
+pub(crate) fn save_to_file(messages: &(Vec<Message>, Vec<Message>), first_path: &str, second_path: &str) -> eyre::Result<()> {
     let file1 = File::create(first_path)?;
     let (a, b) = messages;
     let writer1 = BufWriter::new(file1);

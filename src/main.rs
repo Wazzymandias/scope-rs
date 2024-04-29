@@ -1,20 +1,22 @@
 #![feature(unix_sigpipe)]
 #![feature(duration_constructors)]
 
+extern crate core;
+
 use clap::Parser;
 use slog::{Drain, Logger, o, PushFnValue, Record};
 use slog_async::Async;
 use slog_json::Json;
 use slog_scope;
 
-use crate::cli::Command;
+use crate::cmd::cmd::Command;
 
 mod proto {
     include!("pb.rs");
 }
-mod cli;
+
 mod hub_diff;
-mod sync_id;
+mod cmd;
 mod farcaster;
 
 fn create_logger() -> Logger {
