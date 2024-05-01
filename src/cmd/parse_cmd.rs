@@ -60,7 +60,7 @@ impl SyncIdCommand {
         let bytes: Vec<u8> = parts
             .iter()
             .map(|part| {
-                let result = part.parse::<u8>();
+                let result = part.trim().parse::<u8>();
                 if result.is_err() {
                     println!("error parsing part: {}", part);
                 }
@@ -80,25 +80,25 @@ impl SyncIdCommand {
         println!("{}", d.to_string());
 
         // let source_file = File::open("json/source_sync_ids.json")?;
-        let source_file = File::open("json/target_sync_ids.json")?;
-        let source_reader = BufReader::new(source_file);
-        let source_sync_ids: Result<SyncIds, serde_json::Error> =
-            serde_json::from_reader(source_reader);
-        source_sync_ids
-            .and_then(|sync_ids| {
-                sync_ids.sync_ids.iter().for_each(|sync_id| {
-                    let ts = timestamp_from_sync_id(sync_id);
-                    match ts {
-                        Ok(t) => {
-                            println!("{}", t)
-                        }
-                        _ => {}
-                    }
-                });
-                Ok(())
-            })
-            .expect("TODO: panic message");
-        let target_file = File::open("json/target_sync_ids.json")?;
+        // let source_file = File::open("json/target_sync_ids.json")?;
+        // let source_reader = BufReader::new(source_file);
+        // let source_sync_ids: Result<SyncIds, serde_json::Error> =
+        //     serde_json::from_reader(source_reader);
+        // source_sync_ids
+        //     .and_then(|sync_ids| {
+        //         sync_ids.sync_ids.iter().for_each(|sync_id| {
+        //             let ts = timestamp_from_sync_id(sync_id);
+        //             match ts {
+        //                 Ok(t) => {
+        //                     println!("{}", t)
+        //                 }
+        //                 _ => {}
+        //             }
+        //         });
+        //         Ok(())
+        //     })
+        //     .expect("TODO: panic message");
+        // let target_file = File::open("json/target_sync_ids.json")?;
 
         Ok(())
     }

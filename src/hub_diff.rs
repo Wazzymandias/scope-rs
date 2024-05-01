@@ -203,6 +203,7 @@ impl HubStateDiffer {
                     drop(q);
 
                     t.insert(href.as_bytes(), vec![])?;
+                    t.flush()?;
                     Ok(())
                 }).await??;
             }
@@ -233,7 +234,10 @@ impl HubStateDiffer {
 
             let workers = (0..WORKER_POOL_SIZE).map(|i| {
                 slog_scope::info!("spawning worker {:?}", i);
-                let endpoint = endpoint.clone();
+                let endpoint = endpoint.clone()
+                    .buffer_size(32768)
+                    .timeout(Duration::from_secs(3))
+                    .concurrency_limit(256);
                 let queue = Arc::clone(&queue);
                 HubStateDiffer::sync_worker(endpoint, queue, tree.clone())
             });
@@ -260,7 +264,7 @@ impl HubStateDiffer {
                     match res {
                         Ok(sync_ids_result) => {
                             sync_ids_result.into_iter().for_each(|sync_id| {
-                                batch.insert(vec![sync_id[TIMESTAMP_LENGTH]], sync_id.to_vec());
+                                batch.insert(sync_id.to_vec(), vec![]);
                             });
                         }
                         Err(e) => {
@@ -272,7 +276,7 @@ impl HubStateDiffer {
                 t.flush().unwrap();
             }).await?;
 
-            current_time = current_time - 600;
+            current_time = current_time - TIME_WINDOW_SECONDS;
             info!("successfully processed batch of messages"; "ts" => current_time);
         }
 
