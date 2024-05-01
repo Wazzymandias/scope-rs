@@ -29,6 +29,7 @@ futures = "0.3.30"
 chrono = "0.4.38"
 histogram = "0.10.0"
 sled = "0.34.7"
+blake3 = "1.5.1"
 
 [profile.dev]
 incremental = true

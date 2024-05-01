@@ -56,26 +56,26 @@ impl DiffCommand {
         let target_endpoint =
             crate::cmd::cmd::load_endpoint(&target_config, &self.target_endpoint)?;
 
-        let result = HubStateDiffer::watch(source_endpoint, target_endpoint).await;
+        // let result = HubStateDiffer::watch(source_endpoint, target_endpoint).await;
 
-        result
-        // let state_differ = HubStateDiffer::new(source_endpoint, target_endpoint);
-        // let (source, target) = state_differ
-        //     .diff_exhaustive()
-        //     .await
-        //     .or_else(|e| Err(eyre!("{:?}", e)))?;
-        // let output =
-        //     serde_json::to_string_pretty(&(&source, &target)).or_else(|e| Err(eyre!("{:?}", e)))?;
-        // let mut hist = histogram::Histogram::new(7, 64)?;
-        // for message in target.iter() {
-        //     if !source.contains(message) {
-        //         slog_scope::info!("message not found in source: {:?}", message);
-        //         hist.increment(message.clone().data.unwrap().timestamp.clone() as u64)?;
-        //     }
-        // }
-        // println!("{:?}", histogram::SparseHistogram::from(&hist));
-        // crate::cmd::cmd::save_to_file(&(source, target), "messages1.json", "messages2.json")
-        //     .or_else(|e| Err(eyre!("{:?}", e)))?;
-        // Ok(println!("{}", output))
+        // result
+        let state_differ = HubStateDiffer::new(source_endpoint, target_endpoint);
+        let (source, target) = state_differ
+            .diff_exhaustive()
+            .await
+            .or_else(|e| Err(eyre!("{:?}", e)))?;
+        let output =
+            serde_json::to_string_pretty(&(&source, &target)).or_else(|e| Err(eyre!("{:?}", e)))?;
+        let mut hist = histogram::Histogram::new(7, 64)?;
+        for message in target.iter() {
+            if !source.contains(message) {
+                slog_scope::info!("message not found in source: {:?}", message);
+                hist.increment(message.clone().data.unwrap().timestamp.clone() as u64)?;
+            }
+        }
+        println!("{:?}", histogram::SparseHistogram::from(&hist));
+        crate::cmd::cmd::save_to_file(&(source, target), "messages1.json", "messages2.json")
+            .or_else(|e| Err(eyre!("{:?}", e)))?;
+        Ok(println!("{}", output))
     }
 }
