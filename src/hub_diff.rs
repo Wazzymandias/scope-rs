@@ -14,7 +14,7 @@ use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LE
 use crate::farcaster::time::{farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, FARCASTER_EPOCH, str_bytes_to_unix_time};
 use eyre::{eyre, OptionExt, Report};
 use histogram::Histogram;
-use sled::{IVec, Tree};
+use sled::{Db, IVec, Tree};
 use slog_scope::info;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{oneshot, watch, Notify};
@@ -47,6 +47,27 @@ fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
     Ok(UNIX_EPOCH + Duration::from_secs(timestamp))
 }
 
+#[derive(Debug)]
+enum DbOperation {
+    Insert { tree: Arc<Tree>, key: Vec<u8>, value: Vec<u8> },
+    // Other operations like Delete, Query, etc., can be defined similarly.
+}
+
+fn spawn_tree_thread(mut channel: Receiver<DbOperation>) {
+    tokio::task::spawn_blocking(move || {
+        while let Some(operation) = channel.blocking_recv() {
+            match operation {
+                DbOperation::Insert { tree, key, value } => {
+                    match tree.insert(key, value) {
+                        Ok(_) => info!("Inserted key", ),
+                        Err(e) => info!("Failed to insert key, error: {:?}", e),
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 struct Item {
     prefix: Vec<u8>,
@@ -60,7 +81,7 @@ pub struct HubStateDiffer {
     endpoint_b: Endpoint,
     tree_b: Arc<Tree>,
     set_a: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
-    set_b: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>
+    set_b: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
 }
 
 fn save_to_file(sync_ids: &SyncIds, path: &str) -> eyre::Result<()> {
@@ -97,13 +118,16 @@ impl HubStateDiffer {
             }
         });
 
+        info!("loaded sets {:?} {:?}", set_a.len(), set_b.len());
+        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
+
         Self {
             endpoint_a,
             tree_a: Arc::new(a_tree),
             endpoint_b,
             tree_b: Arc::new(b_tree),
             set_a: Arc::new(tokio::sync::RwLock::new(set_a)),
-            set_b: Arc::new(tokio::sync::RwLock::new(set_b))
+            set_b: Arc::new(tokio::sync::RwLock::new(set_b)),
         }
     }
 
@@ -112,6 +136,7 @@ impl HubStateDiffer {
         queue: Arc<tokio::sync::RwLock<UniqueQueue<Item>>>,
         tree: Arc<Tree>,
         set: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
+        sender: Sender<DbOperation>
     ) -> eyre::Result<Vec<Vec<u8>>> {
         const BATCH_SIZE: usize = 32;
         let mut result: Vec<Vec<u8>> = vec![];
@@ -152,13 +177,11 @@ impl HubStateDiffer {
                     }
                 }
 
-                let t = tree.clone();
-                tokio::task::spawn_blocking(move || -> eyre::Result<()> {
-                    if (metadata.num_messages as usize) <= 1 {
-                        t.insert(metadata.prefix, metadata.hash.as_bytes().to_vec())?;
-                    }
-                    Ok(())
-                }).await??;
+                sender.send(DbOperation::Insert {
+                    tree: tree.clone(),
+                    key: item.prefix,
+                    value: metadata.hash.as_bytes().to_vec(),
+                }).await?;
                 set.write().await.insert(item.hash);
             }
         }
@@ -171,6 +194,8 @@ impl HubStateDiffer {
         end_time: u32,
         tree: Arc<Tree>,
         set: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
+        sender: Sender<DbOperation>,
+        receiver: Receiver<DbOperation>,
     ) -> eyre::Result<SyncIds> {
         const WORKER_POOL_SIZE: usize = 4;
         const TIME_WINDOW_SECONDS: u32 = 600;
@@ -178,6 +203,8 @@ impl HubStateDiffer {
         let mut current_time = start_time;
         let mut sync_ids: Vec<Vec<u8>> = vec![];
         let e = Arc::new(&endpoint);
+
+        spawn_tree_thread(receiver);
 
         while current_time >= end_time {
             let mut q = queue.write().await;
@@ -197,7 +224,7 @@ impl HubStateDiffer {
                     .buffer_size(65536)
                     .concurrency_limit(512);
                 let queue = Arc::clone(&queue);
-                HubStateDiffer::sync_worker(endpoint, queue, tree.clone(), set.clone())
+                HubStateDiffer::sync_worker(endpoint, queue, tree.clone(), set.clone(), sender.clone())
             });
 
             let results = futures::future::join_all(workers).await;
@@ -245,19 +272,27 @@ impl HubStateDiffer {
     pub async fn diff_exhaustive(self) -> eyre::Result<(Vec<Message>, Vec<Message>)> {
         let now = Utc::now();
         let (start, end) = (now.timestamp() as u32, (now - Duration::from_secs(1)).timestamp() as u32);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
         let source_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_a.clone(),
             start,
             end,
             self.tree_a.clone(),
             self.set_a.clone(),
+            sender,
+            receiver,
         ));
+
+        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
         let target_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_b.clone(),
             start,
             end,
             self.tree_b.clone(),
             self.set_b.clone(),
+            sender,
+            receiver,
         ));
 
         let result = futures::future::join(source_handle, target_handle).await;
