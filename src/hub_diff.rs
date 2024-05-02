@@ -13,9 +13,8 @@ use crate::farcaster;
 use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LENGTH};
 use crate::farcaster::time::{farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, FARCASTER_EPOCH, str_bytes_to_unix_time};
 use eyre::{eyre, OptionExt, Report};
-use futures::AsyncWriteExt;
 use histogram::Histogram;
-use sled::Tree;
+use sled::{IVec, Tree};
 use slog_scope::info;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{oneshot, watch, Notify};
@@ -24,6 +23,9 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
+use crate::queue::UniqueQueue;
+
+const PREFIX_SET_KEY: &[u8] = b"prefix_set";
 
 fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
     let timestamp = match &message.data {
@@ -45,93 +47,27 @@ fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
     Ok(UNIX_EPOCH + Duration::from_secs(timestamp))
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct Item {
+    prefix: Vec<u8>,
+    hash: blake3::Hash
+}
+
 #[derive(Debug)]
 pub struct HubStateDiffer {
     endpoint_a: Endpoint,
     tree_a: Arc<Tree>,
     endpoint_b: Endpoint,
     tree_b: Arc<Tree>,
+    set_a: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
+    set_b: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>
 }
-
-struct HubState {}
 
 fn save_to_file(sync_ids: &SyncIds, path: &str) -> eyre::Result<()> {
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
     serde_json::to_writer(writer, sync_ids)?;
     Ok(())
-}
-
-struct UniqueQueue<T> {
-    queue: VecDeque<T>,
-    set: HashSet<T>,
-}
-
-impl<T: Eq + Hash + Clone> UniqueQueue<T> {
-    fn new() -> Self {
-        UniqueQueue {
-            queue: VecDeque::new(),
-            set: HashSet::new(),
-        }
-    }
-
-    fn from(arr: Vec<T>) -> Self {
-        let mut set = HashSet::new();
-        let queue = arr
-            .into_iter()
-            .filter(|item| set.insert(item.clone()))
-            .collect();
-        UniqueQueue { queue, set }
-    }
-
-    fn drain(&mut self) -> Vec<T> {
-        self.queue.drain(..).collect()
-    }
-
-    fn drain_batch(&mut self, batch_size: usize) -> Vec<T> {
-        let drain_until = batch_size.min(self.queue.len());
-        self.queue.drain(..drain_until).collect()
-    }
-
-    fn pop_front(&mut self) -> Option<T> {
-        if let Some(item) = self.queue.pop_front() {
-            self.set.remove(&item);
-            return Some(item);
-        }
-        None
-    }
-
-    fn push_back(&mut self, item: T) {
-        if self.set.insert(item.clone()) {
-            self.queue.push_back(item);
-        }
-    }
-
-    // Add an item to the queue if it's not already present
-    fn enqueue(&mut self, item: T) {
-        if self.set.insert(item.clone()) {
-            self.queue.push_back(item);
-        }
-    }
-
-    // Remove and return the first item from the queue, if any
-    fn dequeue(&mut self) -> Option<T> {
-        if let Some(item) = self.queue.pop_front() {
-            self.set.remove(&item);
-            return Some(item);
-        }
-        None
-    }
-
-    // Peek at the first item in the queue without removing it, if any
-    fn peek(&self) -> Option<&T> {
-        self.queue.front()
-    }
-
-    // Check if the queue is empty
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
 }
 
 impl HubStateDiffer {
@@ -142,70 +78,88 @@ impl HubStateDiffer {
         let a_tree = db.open_tree(a_tree_prefix).unwrap();
         let b_tree = db.open_tree(b_tree_prefix).unwrap();
 
+        let mut set_a: HashSet<blake3::Hash> = HashSet::new();
+        let mut set_b: HashSet<blake3::Hash> = HashSet::new();
+        a_tree.get(PREFIX_SET_KEY).unwrap().map(|v| {
+            let mut i = 0;
+            while i < v.len() {
+                let b: [u8; 32] = v[i..i+32].try_into().unwrap();
+                set_a.insert(blake3::Hash::from_bytes(b));
+                i += 32;
+            }
+        });
+        b_tree.get(PREFIX_SET_KEY).unwrap().map(|v| {
+            let mut i = 0;
+            while i < v.len() {
+                let b: [u8; 32] = v[i..i+32].try_into().unwrap();
+                set_b.insert(blake3::Hash::from_bytes(b));
+                i += 32;
+            }
+        });
+
         Self {
             endpoint_a,
             tree_a: Arc::new(a_tree),
             endpoint_b,
             tree_b: Arc::new(b_tree),
+            set_a: Arc::new(tokio::sync::RwLock::new(set_a)),
+            set_b: Arc::new(tokio::sync::RwLock::new(set_b))
         }
     }
 
     async fn sync_worker(
         endpoint: Endpoint,
-        queue: Arc<tokio::sync::RwLock<UniqueQueue<Vec<u8>>>>,
+        queue: Arc<tokio::sync::RwLock<UniqueQueue<Item>>>,
         tree: Arc<Tree>,
+        set: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
     ) -> eyre::Result<Vec<Vec<u8>>> {
-        const BATCH_SIZE: usize = 10;
+        const BATCH_SIZE: usize = 32;
         let mut result: Vec<Vec<u8>> = vec![];
         let mut client = HubServiceClient::connect(endpoint).await?;
         while !queue.read().await.is_empty() {
-            let prefixes = queue.write().await.drain_batch(BATCH_SIZE);
-            for prefix in prefixes {
-                if prefix.is_empty() {
+            let items = queue.write().await.drain_batch(BATCH_SIZE);
+            for item in items {
+                if item.prefix.is_empty() {
                     continue;
                 }
 
-                let t = tree.clone();
-                let h = blake3::hash(&prefix.as_slice());
-                let href = h.clone();
-                let has_key = tokio::task::spawn_blocking(move || {
-                    t.contains_key(href.as_bytes()).unwrap()
-                }).await?;
-                if has_key {
-                    continue
+                if set.read().await.contains(&item.hash) {
+                    continue;
                 }
 
                 let sync_ids = client
                     .get_all_sync_ids_by_prefix(TrieNodePrefix {
-                        prefix: prefix.clone(),
+                        prefix: item.prefix.clone(),
                     })
                     .await?
                     .into_inner();
                 let metadata = client
                     .get_sync_metadata_by_prefix(TrieNodePrefix {
-                        prefix: prefix.clone(),
+                        prefix: item.prefix.clone(),
                     })
                     .await?
                     .into_inner();
                 result.extend(sync_ids.sync_ids);
 
-                let t = tree.clone();
-                let href = h.clone();
-                let mut q = queue.clone();
-                tokio::task::spawn_blocking(move || -> eyre::Result<()> {
-                    for child in metadata.children.iter() {
-                        let child_h = blake3::hash(child.prefix.as_slice());
-                        if child.num_messages > 0 && !t.contains_key(child_h.as_bytes())? {
-                            info!("enqueuing child prefix: {:?}", child.prefix);
-                            q.blocking_write().push_back(child.prefix.clone());
-                        }
+                for child in metadata.children.iter() {
+                    let child_h = blake3::hash(child.prefix.as_slice());
+                    if child.num_messages > 0 && !set.read().await.contains(&child_h) {
+                        info!("enqueuing child prefix: {:?} {:?}", child.prefix, child.prefix.len());
+                        queue.write().await.push_back(Item{
+                            prefix: child.prefix.clone(),
+                            hash: child_h
+                        });
                     }
-                    drop(q);
+                }
 
-                    t.insert(href.as_bytes(), vec![])?;
-                    t.flush()?;
+                let t = tree.clone();
+                tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+                    if (metadata.num_messages as usize) <= 1 {
+                        t.insert(metadata.prefix, metadata.hash.as_bytes().to_vec())?;
+                    }
                     Ok(())
                 }).await??;
+                set.write().await.insert(item.hash);
             }
         }
         Ok(result)
@@ -216,6 +170,7 @@ impl HubStateDiffer {
         start_time: u32,
         end_time: u32,
         tree: Arc<Tree>,
+        set: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
     ) -> eyre::Result<SyncIds> {
         const WORKER_POOL_SIZE: usize = 4;
         const TIME_WINDOW_SECONDS: u32 = 600;
@@ -228,18 +183,21 @@ impl HubStateDiffer {
             let mut q = queue.write().await;
             for t in (current_time - TIME_WINDOW_SECONDS..current_time - 1).rev() {
                 let prefix = farcaster_time_to_str(t - FARCASTER_EPOCH as u32).as_bytes().to_vec();
-                q.enqueue(prefix);
+                let hash = blake3::hash(prefix.as_slice());
+                q.enqueue(Item{
+                    prefix,
+                    hash,
+                });
             }
             drop(q);
 
             let workers = (0..WORKER_POOL_SIZE).map(|i| {
                 slog_scope::info!("spawning worker {:?}", i);
                 let endpoint = endpoint.clone()
-                    .buffer_size(32768)
-                    .timeout(Duration::from_secs(3))
-                    .concurrency_limit(256);
+                    .buffer_size(65536)
+                    .concurrency_limit(512);
                 let queue = Arc::clone(&queue);
-                HubStateDiffer::sync_worker(endpoint, queue, tree.clone())
+                HubStateDiffer::sync_worker(endpoint, queue, tree.clone(), set.clone())
             });
 
             let results = futures::future::join_all(workers).await;
@@ -258,23 +216,19 @@ impl HubStateDiffer {
             });
 
             let t = tree.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut batch = sled::Batch::default();
-                results.into_iter().for_each(|res| {
-                    match res {
-                        Ok(sync_ids_result) => {
-                            sync_ids_result.into_iter().for_each(|sync_id| {
-                                batch.insert(sync_id.to_vec(), vec![]);
-                            });
-                        }
-                        Err(e) => {
-                            slog_scope::error!("Batch error: {:?}", e);
-                        }
+            let s = set.clone();
+            tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+                let existing = t.get(PREFIX_SET_KEY).unwrap().ok_or(eyre!("no existing set")).unwrap_or_default();
+                let mut value = existing.to_vec();
+                for hash in s.blocking_read().iter() {
+                    let hash_bytes = hash.as_bytes();
+                    if !existing.windows(32).any(|w| w == hash_bytes) {
+                        value.extend_from_slice(hash_bytes);
                     }
-                });
-                t.apply_batch(batch).expect("TODO: panic message");
-                t.flush().unwrap();
-            }).await?;
+                }
+                t.insert(PREFIX_SET_KEY, IVec::from(value))?;
+                Ok(())
+            }).await??;
 
             current_time = current_time - TIME_WINDOW_SECONDS;
             info!("successfully processed batch of messages"; "ts" => current_time);
@@ -290,18 +244,20 @@ impl HubStateDiffer {
     // since it is expensive, we should take the result and persist it to a file as well
     pub async fn diff_exhaustive(self) -> eyre::Result<(Vec<Message>, Vec<Message>)> {
         let now = Utc::now();
-        let (start, end) = (now.timestamp() as u32, (now - Duration::from_days(1)).timestamp() as u32);
+        let (start, end) = (now.timestamp() as u32, (now - Duration::from_secs(1)).timestamp() as u32);
         let source_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_a.clone(),
             start,
             end,
             self.tree_a.clone(),
+            self.set_a.clone(),
         ));
         let target_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_b.clone(),
             start,
             end,
             self.tree_b.clone(),
+            self.set_b.clone(),
         ));
 
         let result = futures::future::join(source_handle, target_handle).await;
