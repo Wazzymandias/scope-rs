@@ -12,18 +12,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::farcaster;
 use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LENGTH};
 use crate::farcaster::time::{farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, FARCASTER_EPOCH, str_bytes_to_unix_time};
-use eyre::{eyre, OptionExt, Report};
+use eyre::{eyre};
 use histogram::Histogram;
-use sled::{Db, IVec, Tree};
+use sled::{IVec, Tree};
 use slog_scope::info;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{oneshot, watch, Notify};
-use tokio::time;
+use tokio::task::JoinHandle;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
-use crate::queue::UniqueQueue;
+use crate::queue::Queue;
 
 const PREFIX_SET_KEY: &[u8] = b"prefix_set";
 
@@ -53,13 +52,15 @@ enum DbOperation {
     // Other operations like Delete, Query, etc., can be defined similarly.
 }
 
-fn spawn_tree_thread(mut channel: Receiver<DbOperation>) {
-    tokio::task::spawn_blocking(move || {
+fn spawn_tree_thread(mut channel: Receiver<DbOperation>) -> JoinHandle<()> {
+    return tokio::task::spawn_blocking(move || {
         while let Some(operation) = channel.blocking_recv() {
             match operation {
                 DbOperation::Insert { tree, key, value } => {
                     match tree.insert(key, value) {
-                        Ok(_) => info!("Inserted key", ),
+                        Ok(_) => {
+
+                        },
                         Err(e) => info!("Failed to insert key, error: {:?}", e),
                     }
                 }
@@ -118,8 +119,8 @@ impl HubStateDiffer {
             }
         });
 
-        info!("loaded sets {:?} {:?}", set_a.len(), set_b.len());
-        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
+        info!("loaded database [sets: {:?} {:?}] [trees: {:?} {:?}]",
+            set_a.len(), set_b.len(), a_tree.len(), b_tree.len());
 
         Self {
             endpoint_a,
@@ -133,16 +134,21 @@ impl HubStateDiffer {
 
     async fn sync_worker(
         endpoint: Endpoint,
-        queue: Arc<tokio::sync::RwLock<UniqueQueue<Item>>>,
+        queue: Arc<tokio::sync::RwLock<Queue<Item>>>,
         tree: Arc<Tree>,
         set: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
-        sender: Sender<DbOperation>
-    ) -> eyre::Result<Vec<Vec<u8>>> {
-        const BATCH_SIZE: usize = 32;
-        let mut result: Vec<Vec<u8>> = vec![];
+        sender: Sender<DbOperation>,
+        counter: Arc<AtomicUsize>,
+    ) -> eyre::Result<Vec<SyncIds>> {
+        const BATCH_SIZE: usize = 3;
+        let mut result: Vec<SyncIds> = vec![];
         let mut client = HubServiceClient::connect(endpoint).await?;
-        while !queue.read().await.is_empty() {
+        while !(counter.load(SeqCst) == 0) {
             let items = queue.write().await.drain_batch(BATCH_SIZE);
+            if items.len() == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             for item in items {
                 if item.prefix.is_empty() {
                     continue;
@@ -152,24 +158,27 @@ impl HubStateDiffer {
                     continue;
                 }
 
-                let sync_ids = client
-                    .get_all_sync_ids_by_prefix(TrieNodePrefix {
-                        prefix: item.prefix.clone(),
-                    })
-                    .await?
-                    .into_inner();
                 let metadata = client
                     .get_sync_metadata_by_prefix(TrieNodePrefix {
                         prefix: item.prefix.clone(),
                     })
                     .await?
                     .into_inner();
-                result.extend(sync_ids.sync_ids);
+
+                if metadata.children.is_empty() {
+                    let sync_ids = client
+                        .get_all_sync_ids_by_prefix(TrieNodePrefix {
+                            prefix: metadata.prefix,
+                        })
+                        .await?
+                        .into_inner();
+                    result.push(sync_ids);
+                }
 
                 for child in metadata.children.iter() {
                     let child_h = blake3::hash(child.prefix.as_slice());
                     if child.num_messages > 0 && !set.read().await.contains(&child_h) {
-                        info!("enqueuing child prefix: {:?} {:?}", child.prefix, child.prefix.len());
+                        counter.fetch_add(1, SeqCst);
                         queue.write().await.push_back(Item{
                             prefix: child.prefix.clone(),
                             hash: child_h
@@ -177,12 +186,16 @@ impl HubStateDiffer {
                     }
                 }
 
-                sender.send(DbOperation::Insert {
-                    tree: tree.clone(),
-                    key: item.prefix,
-                    value: metadata.hash.as_bytes().to_vec(),
-                }).await?;
+                if metadata.num_messages <= 1 {
+                    info!("inserting item into db: {:?}", item.prefix);
+                    sender.send(DbOperation::Insert {
+                        tree: tree.clone(),
+                        key: item.prefix,
+                        value: metadata.hash.as_bytes().to_vec(),
+                    }).await?;
+                }
                 set.write().await.insert(item.hash);
+                counter.fetch_sub(1, SeqCst);
             }
         }
         Ok(result)
@@ -195,22 +208,25 @@ impl HubStateDiffer {
         tree: Arc<Tree>,
         set: Arc<tokio::sync::RwLock<HashSet<blake3::Hash>>>,
         sender: Sender<DbOperation>,
-        receiver: Receiver<DbOperation>,
     ) -> eyre::Result<SyncIds> {
-        const WORKER_POOL_SIZE: usize = 4;
+        const WORKER_POOL_SIZE: usize = 8;
         const TIME_WINDOW_SECONDS: u32 = 600;
-        let queue = Arc::new(tokio::sync::RwLock::new(UniqueQueue::new()));
+        let queue = Arc::new(tokio::sync::RwLock::new(Queue::new()));
         let mut current_time = start_time;
-        let mut sync_ids: Vec<Vec<u8>> = vec![];
-        let e = Arc::new(&endpoint);
-
-        spawn_tree_thread(receiver);
+        let mut sync_ids: Vec<SyncIds> = vec![];
+        let mut counter = Arc::new(AtomicUsize::new(0));
 
         while current_time >= end_time {
+            let start_time = Utc::now();
             let mut q = queue.write().await;
-            for t in (current_time - TIME_WINDOW_SECONDS..current_time - 1).rev() {
+            let batch_size = TIME_WINDOW_SECONDS.min(current_time - end_time);
+            let start = current_time - batch_size;
+            let end = current_time;
+            info!("processing batch of messages"; "ts" => current_time, "start" => start, "end" => end);
+            for t in (start..end).rev() {
                 let prefix = farcaster_time_to_str(t - FARCASTER_EPOCH as u32).as_bytes().to_vec();
                 let hash = blake3::hash(prefix.as_slice());
+                counter.fetch_add(1, SeqCst);
                 q.enqueue(Item{
                     prefix,
                     hash,
@@ -219,50 +235,61 @@ impl HubStateDiffer {
             drop(q);
 
             let workers = (0..WORKER_POOL_SIZE).map(|i| {
-                slog_scope::info!("spawning worker {:?}", i);
+                info!("spawning worker {:?}", i);
                 let endpoint = endpoint.clone()
                     .buffer_size(65536)
                     .concurrency_limit(512);
                 let queue = Arc::clone(&queue);
-                HubStateDiffer::sync_worker(endpoint, queue, tree.clone(), set.clone(), sender.clone())
-            });
+                let tree = tree.clone();
+                let set = set.clone();
+                let sender = sender.clone();
+                let counter = counter.clone();
+
+                tokio::task::spawn(async move {
+                    HubStateDiffer::sync_worker(endpoint, queue, tree, set, sender, counter).await
+                })
+            }).collect::<Vec<JoinHandle<_>>>();
 
             let results = futures::future::join_all(workers).await;
-            (&results).into_iter().for_each(|res| {
-                match res {
-                    Ok(sync_ids_result) => {
+            for result in results {
+                match result {
+                    Ok(Ok(sync_ids_result)) => {
                         // `sync_ids` is of type `HashSet<Vec<u8>>` here, coming from the spawned task.
                         slog_scope::info!("Task completed successfully: {:?}", sync_ids_result.len());
-                        sync_ids.extend(sync_ids_result.clone());
+                        sync_ids.extend(sync_ids_result);
                     } // The task completed successfully.
+                    Ok(Err(e)) => {
+                        // `e` is of type `eyre::Report` here, coming from the spawned task.
+                        slog_scope::error!("Task join error: {:?}", e);
+                    } // The task returned an error.
                     Err(e) => {
                         // `e` is of type `ErrReport` here, coming from the spawned task.
                         slog_scope::error!("Task error: {:?}", e);
                     }
                 }
-            });
+            }
 
+            let set_size = set.read().await.len();
+            info!("inserting prefix set into db [size: {:?}]", set_size);
             let t = tree.clone();
-            let s = set.clone();
-            tokio::task::spawn_blocking(move || -> eyre::Result<()> {
-                let existing = t.get(PREFIX_SET_KEY).unwrap().ok_or(eyre!("no existing set")).unwrap_or_default();
-                let mut value = existing.to_vec();
-                for hash in s.blocking_read().iter() {
-                    let hash_bytes = hash.as_bytes();
-                    if !existing.windows(32).any(|w| w == hash_bytes) {
-                        value.extend_from_slice(hash_bytes);
-                    }
-                }
-                t.insert(PREFIX_SET_KEY, IVec::from(value))?;
-                Ok(())
-            }).await??;
+            let mut hash_set_bytes = Vec::with_capacity(set.read().await.len() * blake3::OUT_LEN);
+            for hash in set.read().await.iter() {
+                hash_set_bytes.extend_from_slice(hash.as_bytes());
+            }
 
-            current_time = current_time - TIME_WINDOW_SECONDS;
-            info!("successfully processed batch of messages"; "ts" => current_time);
+            sender.send(DbOperation::Insert {
+                tree: t,
+                key: PREFIX_SET_KEY.to_vec(),
+                value: hash_set_bytes,
+            }).await?;
+
+            current_time = current_time - batch_size - 1;
+            info!("successfully processed batch of messages [duration: {:?}] [sync_ids: {:?}]",
+                Utc::now() - start_time, sync_ids.len());
         }
 
         return Ok(SyncIds{
-            sync_ids,
+            sync_ids: sync_ids.into_iter().flat_map(|s| s.sync_ids).collect(),
         });
     }
 
@@ -271,31 +298,31 @@ impl HubStateDiffer {
     // since it is expensive, we should take the result and persist it to a file as well
     pub async fn diff_exhaustive(self) -> eyre::Result<(Vec<Message>, Vec<Message>)> {
         let now = Utc::now();
-        let (start, end) = (now.timestamp() as u32, (now - Duration::from_secs(1)).timestamp() as u32);
+        let (start, end) = (now.timestamp() as u32, (now - Duration::from_days(1)).timestamp() as u32);
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
+        let db_handle = spawn_tree_thread(receiver);
         let source_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_a.clone(),
             start,
             end,
             self.tree_a.clone(),
             self.set_a.clone(),
-            sender,
-            receiver,
+            sender.clone(),
         ));
 
-        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
         let target_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_b.clone(),
             start,
             end,
             self.tree_b.clone(),
             self.set_b.clone(),
-            sender,
-            receiver,
+            sender.clone(),
         ));
 
         let result = futures::future::join(source_handle, target_handle).await;
+        drop(sender);
+
         let (source_sync_ids, target_sync_ids) = result;
 
         let source: SyncIds;
@@ -328,21 +355,27 @@ impl HubStateDiffer {
                 hist.increment(farcaster_to_unix(timestamp as u64))?;
             }
         }
-        let mut v: Vec<_> = missing.into_iter().collect();
-        v.sort_by_key(|&(key, _)| key);
-        slog_scope::info!("missing: {:?}", v);
-        let sparse = histogram::SparseHistogram::from(&hist);
-        let pct = hist.percentiles(&[50.0, 75.0, 90.0, 99.0, 99.9, 99.99])?;
-        slog_scope::info!("histogram: {:?}", sparse);
-        slog_scope::info!("percentiles: {:?}", pct);
-        let median = sparse.percentile(50.0).unwrap();
-        slog_scope::info!("median: {:?} {:?}", median.start(), median.end());
+
+        if missing.len() == 0 {
+            info!("no missing sync ids between source and target endpoints",);
+        } else {
+            let mut v: Vec<_> = missing.into_iter().collect();
+            v.sort_by_key(|&(key, _)| key);
+            slog_scope::info!("missing: {:?}", v);
+            let sparse = histogram::SparseHistogram::from(&hist);
+            let pct = hist.percentiles(&[50.0, 75.0, 90.0, 99.0, 99.9, 99.99])?;
+            slog_scope::info!("histogram: {:?}", sparse);
+            slog_scope::info!("percentiles: {:?}", pct);
+            let median = sparse.percentile(50.0).unwrap();
+            slog_scope::info!("median: {:?} {:?}", median.start(), median.end());
+        }
+
         let source_messages =
             HubStateDiffer::messages_by_sync_ids(self.endpoint_a.clone(), source).await?;
         let target_messages =
             HubStateDiffer::messages_by_sync_ids(self.endpoint_b.clone(), target).await?;
-        slog_scope::info!("source messages: {:?}", source_messages.len());
-        slog_scope::info!("target messages: {:?}", target_messages.len());
+        info!("source messages: {:?}", source_messages.len());
+        info!("target messages: {:?}", target_messages.len());
 
         Ok((source_messages, target_messages))
     }

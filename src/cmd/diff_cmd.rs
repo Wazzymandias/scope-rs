@@ -65,7 +65,7 @@ impl DiffCommand {
             .await
             .or_else(|e| Err(eyre!("{:?}", e)))?;
         let output =
-            serde_json::to_string_pretty(&(&source, &target)).or_else(|e| Err(eyre!("{:?}", e)))?;
+            serde_json::to_string(&(&source, &target)).or_else(|e| Err(eyre!("{:?}", e)))?;
         let mut hist = histogram::Histogram::new(7, 64)?;
         for message in target.iter() {
             if !source.contains(message) {
