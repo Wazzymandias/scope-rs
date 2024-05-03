@@ -279,7 +279,9 @@ impl HubStateDiffer {
 
             let mut p = pending.write().await;
             let mut q = queue.write().await;
-            if p.len() > 0 {
+            let pending_count = p.len();
+            if pending_count > 0 {
+                info!("enqueuing pending items to be processed [pending: {:?}]", pending_count);
                 while let Some(item) = p.pop_front() {
                     q.push_back(item);
                 }
