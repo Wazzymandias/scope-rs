@@ -18,7 +18,6 @@ mod proto {
 mod cmd;
 mod farcaster;
 mod hub_diff;
-mod queue;
 
 fn create_logger() -> Logger {
     let drain = Json::new(std::io::stdout())
