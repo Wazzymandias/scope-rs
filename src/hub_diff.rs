@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::farcaster;
-use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LENGTH};
+use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LENGTH, FID_BYTES};
 use crate::farcaster::time::{farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, FARCASTER_EPOCH, str_bytes_to_unix_time};
 use eyre::{eyre};
 use histogram::Histogram;
@@ -116,7 +116,7 @@ impl HubStateDiffer {
     }
 
     async fn sync_worker(
-        endpoint: Endpoint,
+        mut client: HubServiceClient<Channel>,
         queue: Arc<tokio::sync::RwLock<VecDeque<Item>>>,
         pending: Arc<tokio::sync::RwLock<VecDeque<Item>>>,
         tree: Arc<Tree>,
@@ -125,7 +125,6 @@ impl HubStateDiffer {
     ) -> eyre::Result<Vec<SyncIds>> {
         const BATCH_SIZE: usize = 1;
         let mut result: Vec<SyncIds> = vec![];
-        let mut client = HubServiceClient::connect(endpoint).await?;
         while !(counter.load(SeqCst) == 0) {
             let mut q = queue.write().await;
             let qn = q.len();
@@ -221,6 +220,7 @@ impl HubStateDiffer {
         let mut sync_ids: Vec<SyncIds> = vec![];
         let counter = Arc::new(AtomicUsize::new(0));
 
+        let client = HubServiceClient::connect(endpoint).await?;
         while current_time >= end_time {
             let start_time = Utc::now();
             let mut q = queue.write().await;
@@ -239,9 +239,8 @@ impl HubStateDiffer {
             drop(q);
 
             info!("spawning {:?} workers", WORKER_POOL_SIZE);
-            let workers = (0..WORKER_POOL_SIZE).map(|i| {
-                let endpoint = endpoint.clone()
-                    .timeout(Duration::from_secs(10));
+            let workers = (0..WORKER_POOL_SIZE).map(|_| {
+                let client = client.clone();
                 let queue = Arc::clone(&queue);
                 let pending = pending.clone();
                 let tree = tree.clone();
@@ -249,7 +248,7 @@ impl HubStateDiffer {
                 let counter = counter.clone();
 
                 tokio::task::spawn(async move {
-                    HubStateDiffer::sync_worker(endpoint, queue, pending, tree, sender, counter).await
+                    HubStateDiffer::sync_worker(client, queue, pending, tree, sender, counter).await
                 })
             }).collect::<Vec<JoinHandle<_>>>();
 

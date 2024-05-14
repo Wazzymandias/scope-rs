@@ -28,7 +28,10 @@ fn create_logger() -> Logger {
         ))
         .build()
         .fuse();
-    let drain = Async::new(drain).build().fuse();
+    let drain = Async::new(drain)
+        .chan_size(8192)
+        .build()
+        .fuse();
 
     Logger::root(drain, o!())
 }

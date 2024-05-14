@@ -3,10 +3,10 @@ use std::convert::TryInto;
 
 // Given constants and types for the simulation
 pub const TIMESTAMP_LENGTH: usize = 10;
-const FID_BYTES: usize = 4; // Assuming 4 bytes for fid
-const HASH_LENGTH: usize = 20; // Assuming fixed length for hash, for simplicity
+pub const FID_BYTES: usize = 4; // Assuming 4 bytes for fid
+pub const HASH_LENGTH: usize = 20; // Assuming fixed length for hash, for simplicity
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Eq, PartialEq, Hash)]
 pub enum RootPrefix {
     /* Used for multiple purposes, starts with a 4-byte fid */
     User = 1,
@@ -112,6 +112,29 @@ impl RootPrefix {
             RootPrefix::VerificationByAddress => 25,
             RootPrefix::ConnectedPeers => 26,
             RootPrefix::FNameUserNameProofByFid => 27,
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            RootPrefix::User => "User".to_string(),
+            RootPrefix::CastsByParent => "CastsByParent".to_string(),
+            RootPrefix::CastsByMention => "CastsByMention".to_string(),
+            RootPrefix::LinksByTarget => "LinksByTarget".to_string(),
+            RootPrefix::ReactionsByTarget => "ReactionsByTarget".to_string(),
+            RootPrefix::HubState => "HubState".to_string(),
+            RootPrefix::JobRevokeMessageBySigner => "JobRevokeMessageBySigner".to_string(),
+            RootPrefix::SyncMerkleTrieNode => "SyncMerkleTrieNode".to_string(),
+            RootPrefix::HubCleanShutdown => "HubCleanShutdown".to_string(),
+            RootPrefix::HubEvents => "HubEvents".to_string(),
+            RootPrefix::Network => "Network".to_string(),
+            RootPrefix::FNameUserNameProof => "FNameUserNameProof".to_string(),
+            RootPrefix::UserNameProofByName => "UserNameProofByName".to_string(),
+            RootPrefix::OnChainEvent => "OnChainEvent".to_string(),
+            RootPrefix::DBSchemaVersion => "DBSchemaVersion".to_string(),
+            RootPrefix::VerificationByAddress => "VerificationByAddress".to_string(),
+            RootPrefix::ConnectedPeers => "ConnectedPeers".to_string(),
+            RootPrefix::FNameUserNameProofByFid => "FNameUserNameProofByFid".to_string(),
         }
     }
 }

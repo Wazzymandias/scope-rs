@@ -1,4 +1,5 @@
 use chrono::Utc;
+use crate::farcaster::sync_id::TIMESTAMP_LENGTH;
 
 pub const FARCASTER_EPOCH: u64 = 1609459200; // Seconds from UNIX_EPOCH to Jan 1, 2021
 pub fn farcaster_to_unix(timestamp: u64) -> u64 {
@@ -12,6 +13,15 @@ pub fn farcaster_time_range(
     let start = start.timestamp() as u32 - (FARCASTER_EPOCH) as u32;
     let end = end.timestamp() as u32 - (FARCASTER_EPOCH) as u32;
     (start..end).step_by(1)
+}
+
+pub fn vec_to_farcaster_timestamp(input: Vec<u8>) -> u32 {
+    if input.len() < TIMESTAMP_LENGTH {
+        return 0;
+    }
+    let ts_bytes = &input[..TIMESTAMP_LENGTH];
+    let ts_str = String::from_utf8(ts_bytes.to_vec()).unwrap();
+    ts_str.parse::<u32>().unwrap()
 }
 
 pub fn farcaster_time_to_str(timestamp: u32) -> String {
