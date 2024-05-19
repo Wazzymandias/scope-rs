@@ -1,5 +1,5 @@
-use chrono::Utc;
 use crate::farcaster::sync_id::TIMESTAMP_LENGTH;
+use chrono::Utc;
 
 pub const FARCASTER_EPOCH: u64 = 1609459200; // Seconds from UNIX_EPOCH to Jan 1, 2021
 pub fn farcaster_to_unix(timestamp: u64) -> u64 {
@@ -32,6 +32,26 @@ pub fn str_bytes_to_unix_time(timestamp: &str) -> u64 {
     let timestamp = timestamp.parse::<u64>().unwrap();
     farcaster_to_unix(timestamp)
 }
+
+// fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
+//     let timestamp = match &message.data {
+//         Some(data) => {
+//             // Directly use the timestamp from `data`
+//             FARCASTER_EPOCH + data.timestamp as u64
+//         }
+//         None => {
+//             // Extract and parse the timestamp from `data_bytes`
+//             message
+//                 .data_bytes
+//                 .as_ref()
+//                 .and_then(|bytes| std::str::from_utf8(&bytes[0..10]).ok())
+//                 .and_then(|s| s.parse::<u64>().ok())
+//                 .map(|t| FARCASTER_EPOCH + t)
+//                 .ok_or_else(|| eyre!("Failed to extract timestamp"))?
+//         }
+//     };
+//     Ok(UNIX_EPOCH + Duration::from_secs(timestamp))
+// }
 
 #[cfg(test)]
 mod tests {

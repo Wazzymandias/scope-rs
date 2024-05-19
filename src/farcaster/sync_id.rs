@@ -140,7 +140,7 @@ impl RootPrefix {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SyncIdType {
+pub enum SyncIdType {
     Unknown = 0,
     Message = 1,
     FName = 2,

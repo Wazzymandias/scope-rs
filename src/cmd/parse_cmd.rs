@@ -1,13 +1,9 @@
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use eyre::eyre;
-use serde::de::Error;
-use std::fs::File;
-use std::io::BufReader;
 
-use crate::farcaster::sync_id::{SyncId, TIMESTAMP_LENGTH};
+use crate::farcaster::sync_id::{FID_BYTES, TIMESTAMP_LENGTH};
 use crate::farcaster::time::{farcaster_to_unix, FARCASTER_EPOCH};
-use crate::proto::SyncIds;
 
 #[derive(Debug, Parser)]
 pub struct ParseCommand {
@@ -78,6 +74,12 @@ impl SyncIdCommand {
         // let x = c.unwrap();
         // let y = x.to_utc().to_string();
         println!("{}", d.to_string());
+        let fid = u32::from_be_bytes(
+            bytes[TIMESTAMP_LENGTH + 1..TIMESTAMP_LENGTH + 1 + FID_BYTES]
+                .try_into()
+                .unwrap(),
+        );
+        println!("fid: {}", fid);
 
         // let source_file = File::open("json/source_sync_ids.json")?;
         // let source_file = File::open("json/target_sync_ids.json")?;
@@ -103,3 +105,22 @@ impl SyncIdCommand {
         Ok(())
     }
 }
+
+// SyncId:
+// Example: [48,49,48,54,50,49,49,50,56,48,1,0,7,243]
+//   1. The first 10 bytes are the timestamp, which is the delta since Farcaster Epoch
+//   2. The next byte is the type of the event
+//   public type(): SyncIdType {
+//     switch (this._bytes[TIMESTAMP_LENGTH]) {
+//       case RootPrefix.User:
+//         return SyncIdType.Message;
+//       case RootPrefix.FNameUserNameProof:
+//         return SyncIdType.FName;
+//       case RootPrefix.OnChainEvent:
+//         return SyncIdType.OnChainEvent;
+//       default:
+//         return SyncIdType.Unknown;
+//     }
+//   }
+//   3. In this case, since the type is 0x01, it is of type User
+//   4. The next 4 bytes are the user FID

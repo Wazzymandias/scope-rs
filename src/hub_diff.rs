@@ -5,84 +5,299 @@ use std::fs::File;
 use std::hash::Hash;
 use std::io::BufWriter;
 use std::path::Path;
+use std::process::exit;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::deque::Deque;
 use crate::farcaster;
-use crate::farcaster::sync_id::{RootPrefix, SyncId, UnpackedSyncId, TIMESTAMP_LENGTH, FID_BYTES};
-use crate::farcaster::time::{farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, FARCASTER_EPOCH, str_bytes_to_unix_time};
-use eyre::{eyre};
+use crate::farcaster::sync_id::{
+    RootPrefix, SyncId, SyncIdType, UnpackedSyncId, FID_BYTES, TIMESTAMP_LENGTH,
+};
+use crate::farcaster::time::{
+    farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, str_bytes_to_unix_time,
+    FARCASTER_EPOCH,
+};
+use crate::lru::LruCache;
+use duckdb::DropBehavior::Panic;
+use duckdb::{params, Connection, ToSql, Transaction};
+use eyre::eyre;
+use farcaster::CachedRepository;
 use histogram::Histogram;
 use sled::{IVec, Tree};
-use slog_scope::info;
+use slog_scope::{debug, info};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tonic::transport::{Channel, Endpoint};
-use slog::debug;
 
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
+use crate::proto::{HubEventType, Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
 
 const PREFIX_SET_KEY: &[u8] = b"prefix_set";
+const DUCKDB_PATH: &str = ".duckdb";
 
-fn extract_timestamp(message: &Message) -> eyre::Result<SystemTime> {
-    let timestamp = match &message.data {
-        Some(data) => {
-            // Directly use the timestamp from `data`
-            FARCASTER_EPOCH + data.timestamp as u64
-        }
-        None => {
-            // Extract and parse the timestamp from `data_bytes`
-            message
-                .data_bytes
-                .as_ref()
-                .and_then(|bytes| std::str::from_utf8(&bytes[0..10]).ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|t| FARCASTER_EPOCH + t)
-                .ok_or_else(|| eyre!("Failed to extract timestamp"))?
-        }
-    };
-    Ok(UNIX_EPOCH + Duration::from_secs(timestamp))
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct DBSyncID {
+    // timestamp_bytes: [u8; 10],
+    // sync_id_type: u8,
+    // data_bytes: Vec<u8>,
+    sync_id_type: u8,
+    timestamp_bytes: Vec<u8>,
+    data_bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
 enum DbOperation {
-    Insert { tree: Arc<Tree>, key: Vec<u8>, value: Vec<u8> },
-    // Other operations like Delete, Query, etc., can be defined similarly.
+    Insert {
+        tree: Tree,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Duck {
+        source: String,
+        sync_id_bytes: Vec<u8>,
+    },
+    DuckBatchSyncIds {
+        source: String,
+        sync_ids_vec: Vec<SyncIds>,
+    },
 }
 
-fn spawn_tree_thread(mut channel: Receiver<DbOperation>) -> JoinHandle<()> {
-    return tokio::task::spawn_blocking(move || {
+fn spawn_tree_thread(
+    mut repo: CachedRepository,
+    mut channel: Receiver<DbOperation>,
+) -> std::thread::JoinHandle<eyre::Result<()>> {
+    return std::thread::spawn(move || {
+        let conn = &mut repo.conn();
+
+        let mut sync_id_lru: LruCache<DBSyncID, u64> = LruCache::new(65536);
         while let Some(operation) = channel.blocking_recv() {
             match operation {
-                DbOperation::Insert { tree, key, value } => {
-                    match tree.insert(key, value) {
-                        Ok(_) => {
+                DbOperation::Insert { tree, key, value } => match tree.insert(key, value) {
+                    Ok(_) => {}
+                    Err(e) => info!("Failed to insert key, error: {:?}", e),
+                },
+                DbOperation::DuckBatchSyncIds {
+                    source,
+                    sync_ids_vec,
+                } => {
+                    let tx_result = conn.transaction();
+                    let tx: Transaction;
+                    match tx_result {
+                        Ok(t) => {
+                            tx = t;
+                        }
+                        Err(e) => {
+                            info!("Failed to start transaction, error: {:?}", e);
+                            continue;
+                        }
+                    }
 
-                        },
-                        Err(e) => info!("Failed to insert key, error: {:?}", e),
+                    let valid_sync_ids = sync_ids_vec
+                        .iter()
+                        .flat_map(|sync_ids| sync_ids.sync_ids.iter())
+                        .filter(|sync_id| sync_id.len() > 10)
+                        .collect::<Vec<_>>();
+                    if valid_sync_ids.is_empty() {
+                        info!("No valid sync ids found for source: {:?}", source);
+                        continue;
+                    }
+                    // Prepare the query with the appropriate number of placeholders
+                    let placeholders: String = valid_sync_ids
+                        .iter()
+                        .map(|_| "(?, ?, ?)")
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let values: Vec<DBSyncID> = valid_sync_ids
+                        .iter()
+                        .map(|sync_id| {
+                            let (timestamp_bytes, rest) = sync_id.split_at(10);
+                            DBSyncID {
+                                timestamp_bytes: timestamp_bytes.to_vec(),
+                                sync_id_type: rest[0],
+                                data_bytes: rest[1..].to_vec(),
+                            }
+                        })
+                        .collect();
+
+                    let to_sql_params: Vec<&dyn ToSql> = values
+                        .iter()
+                        .flat_map(|sync_id| {
+                            vec![
+                                &sync_id.timestamp_bytes as &dyn ToSql,
+                                &sync_id.sync_id_type,
+                                &sync_id.data_bytes,
+                            ]
+                        })
+                        .collect();
+
+                    let insert_sync_ids_query = format!(
+                        "INSERT INTO sync_ids (timestamp_prefix, sync_id_type, data_bytes) \
+                            VALUES {} \
+                            ON CONFLICT (timestamp_prefix,sync_id_type,data_bytes) DO NOTHING \
+                            RETURNING *",
+                        placeholders
+                    );
+                    debug!("executing insert sync ids query: {:?}", insert_sync_ids_query);
+
+                    // 1. Insert the sync ids
+                    let mut statement = tx.prepare(&insert_sync_ids_query).unwrap();
+                    let rows = statement.query(
+                        to_sql_params
+                            .iter()
+                            .map(|&p| p)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    );
+                    if rows.is_err() {
+                        info!("Failed to insert sync_ids, error: {:?}", rows.err());
+                        continue;
+                    }
+
+                    // 2. Get the valid sequence IDs by filtering rows that were actually inserted
+                    // We want to do a comparison which looks like:
+                    // WHERE (timestamp_prefix, sync_id_type, data_bytes) IN ((?, ?, ?), (?, ?, ?), ...)
+
+                    let conditions = format!(
+                        "(timestamp_prefix, sync_id_type, data_bytes) IN ({})",
+                        values
+                            .iter()
+                            .map(|_| "(?, ?, ?)")
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+
+                    let sources_query = format!("SELECT id FROM sync_ids WHERE {}", conditions);
+                    debug!(
+                        "executing sources query: {:?} {:?} {:?}",
+                        sources_query,
+                        to_sql_params.len(),
+                        values.len()
+                    );
+                    let mut sources_statement = tx.prepare(&sources_query).unwrap();
+                    // the valid query params does a search by checking IN functions for each of the three columns
+                    // which is different from the id sql params which does a insert by the tuple for each row
+                    // as a result we loop through the values three times to get the right types for the query
+
+                    let rows = sources_statement
+                        .query_map(to_sql_params.as_slice(), |row| row.get(0))
+                        .unwrap();
+                    let ids: Vec<u64> = rows.map(|r| r.unwrap()).collect();
+
+                    // Prepare and execute the query for inserting into source_sync_ids
+                    let placeholders_source: String =
+                        ids.iter().map(|_| "(?, ?)").collect::<Vec<_>>().join(", ");
+                    let source_params: Vec<&(dyn ToSql + Sync)> = ids
+                        .iter()
+                        .flat_map(|id| vec![&source as &(dyn ToSql + Sync), id])
+                        .collect();
+
+                    let query_source_sync_ids = format!(
+                        "INSERT INTO source_sync_ids (source, sync_id) VALUES {}",
+                        placeholders_source
+                    );
+
+                    let source_sync_ids_result = tx.execute(
+                        &query_source_sync_ids,
+                        source_params
+                            .iter()
+                            .map(|&p| p as &dyn ToSql)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    );
+                    match source_sync_ids_result {
+                        Ok(size) => {
+                            debug!(
+                                "Inserted source_sync_ids: {:?} [channel: {:?}]",
+                                size,
+                                channel.len()
+                            );
+                        }
+                        Err(e) => info!("Failed to insert source_sync_ids, error: {:?}", e),
+                    }
+
+                    let result = tx.commit();
+                    match result {
+                        Ok(_) => {
+                            debug!("Committed transaction {:?}", source);
+                        }
+                        Err(e) => {
+                            info!("Failed to commit transaction, error: {:?}", e);
+                        }
+                    }
+                }
+                DbOperation::Duck {
+                    source,
+                    sync_id_bytes,
+                } => {
+                    let (timestamp_bytes, rest) = sync_id_bytes.split_at(10);
+
+                    if rest.len() < 1 {
+                        info!("Skipping sync_id: {:?}", sync_id_bytes);
+                        continue;
+                    }
+                    let sync_id = DBSyncID {
+                        timestamp_bytes: timestamp_bytes.to_vec(),
+                        sync_id_type: rest[0],
+                        data_bytes: rest[1..].to_vec(),
+                    };
+                    // Insert the sync_id and association in a single execution using CTE
+                    let result = conn.execute(
+                        "INSERT INTO sync_ids (timestamp_prefix, sync_id_type, data_bytes)
+                VALUES (?, ?, ?)",
+                        params![
+                            sync_id.timestamp_bytes,
+                            &sync_id.sync_id_type,
+                            &sync_id.data_bytes,
+                        ],
+                    );
+
+                    match result {
+                        Ok(_) => {}
+                        Err(e) => info!("Failed to insert sync_id, error: {:?}", e),
+                    }
+
+                    let result = conn.execute(
+                        "INSERT INTO source_sync_ids (source, sync_id) \
+                        VALUES (?, currval('seq_sync_id'))",
+                        params![&source],
+                    );
+
+                    match result {
+                        Ok(_) => {}
+                        Err(e) => info!("Failed to insert source_sync_ids, error: {:?}", e),
                     }
                 }
             }
         }
+        repo.stop()
     });
-}
-
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-struct Item {
-    prefix: Vec<u8>,
-    hash: blake3::Hash
 }
 
 #[derive(Debug)]
 pub struct HubStateDiffer {
     endpoint_a: Endpoint,
-    tree_a: Arc<Tree>,
     endpoint_b: Endpoint,
-    tree_b: Arc<Tree>,
+    sync_id_types: Vec<SyncIdType>,
+    repo: CachedRepository,
+}
+
+#[derive(Debug)]
+pub struct SyncIdDiffReport {
+    a: Endpoint,
+    missing_from_a: SyncIds,
+    b: Endpoint,
+    missing_from_b: SyncIds,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct Item {
+    prefix: Vec<u8>,
+    hash: blake3::Hash,
 }
 
 fn save_to_file(sync_ids: &SyncIds, path: &str) -> eyre::Result<()> {
@@ -92,179 +307,199 @@ fn save_to_file(sync_ids: &SyncIds, path: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn tree_contains(tree: Arc<Tree>, key: Vec<u8>) -> sled::Result<bool> {
-    tree.contains_key(key)
+struct PendingItem {
+    entry: Option<Item>,
+    pending: Arc<tokio::sync::RwLock<VecDeque<Item>>>,
 }
 
-impl HubStateDiffer {
-    pub(crate) fn new(endpoint_a: Endpoint, endpoint_b: Endpoint) -> Self {
-        let db = sled::open(".db").unwrap();
-        let a_tree_prefix = endpoint_a.uri().host().unwrap().to_owned();
-        let b_tree_prefix = endpoint_b.uri().host().unwrap().to_owned();
-        let a_tree = db.open_tree(a_tree_prefix).unwrap();
-        let b_tree = db.open_tree(b_tree_prefix).unwrap();
-
-        // the path will be the tree name plus the suffix "hash_trie.bin"
-        info!("loaded database [trees: {:?} {:?}]", a_tree.len(), b_tree.len());
-
+impl PendingItem {
+    fn new(pending: Arc<tokio::sync::RwLock<VecDeque<Item>>>) -> Self {
         Self {
-            endpoint_a,
-            tree_a: Arc::new(a_tree),
-            endpoint_b,
-            tree_b: Arc::new(b_tree),
+            entry: None,
+            pending,
         }
     }
 
+    fn set(&mut self, item: Option<Item>) {
+        self.entry = item;
+    }
+
+    fn clear(&mut self) {
+        self.entry = None;
+    }
+}
+
+impl Drop for PendingItem {
+    fn drop(&mut self) {
+        if let Some(item) = self.entry.take() {
+            let pending = Arc::clone(&self.pending);
+            tokio::spawn(async move {
+                pending.write().await.push_back(item);
+            });
+        }
+    }
+}
+
+impl HubStateDiffer {
+    pub fn sync_id_types(mut self, types: impl IntoIterator<Item = SyncIdType>) -> Self {
+        self.sync_id_types.extend(types);
+        self
+    }
+
+    pub(crate) fn new(endpoint_a: Endpoint, endpoint_b: Endpoint) -> eyre::Result<Self> {
+        let persister = CachedRepository::new(".db".to_string(), DUCKDB_PATH.to_string())?;
+        Ok(Self {
+            endpoint_a,
+            endpoint_b,
+            sync_id_types: vec![],
+            repo: persister,
+        })
+    }
+
     async fn sync_worker(
+        source: String,
         mut client: HubServiceClient<Channel>,
         queue: Arc<tokio::sync::RwLock<VecDeque<Item>>>,
         pending: Arc<tokio::sync::RwLock<VecDeque<Item>>>,
-        tree: Arc<Tree>,
+        tree: Tree,
         sender: Sender<DbOperation>,
-        counter: Arc<AtomicUsize>,
-    ) -> eyre::Result<Vec<SyncIds>> {
-        const BATCH_SIZE: usize = 1;
-        let mut result: Vec<SyncIds> = vec![];
-        while !(counter.load(SeqCst) == 0) {
-            let mut q = queue.write().await;
-            let qn = q.len();
-            let items = q.drain(..BATCH_SIZE.min(qn)).collect::<Vec<_>>();
-            drop(q);
+    ) -> eyre::Result<usize> {
+        let mut num_processed: usize = 0;
+        let mut result_sync_ids: Vec<SyncIds> = vec![];
+        let mut pending_item = PendingItem::new(pending);
 
-            if qn == 0 {
-                // info!("no items found, sleeping...",);
-                // tokio::time::sleep(Duration::from_millis(random::<u8>() as u64 + 8)).await;
-                // let (n, qn) = (counter.load(SeqCst), queue.read().await.len());
-                // info!("waking up [counter: {:?}] [queue: {:?}]", n, qn);
-                break;
+        while !queue.read().await.is_empty() {
+            pending_item.set(queue.write().await.pop_back());
+            let item: &Item;
+            match &pending_item.entry {
+                None => {
+                    break;
+                }
+                Some(i) => {
+                    item = i;
+                }
+            }
+            let exists = CachedRepository::exists_in_cache_tree(&tree, item.hash.as_bytes())?;
+            if exists {
+                pending_item.clear();
+                continue;
             }
 
-            for item in items {
-                if tree_contains(tree.clone(), item.hash.as_bytes().to_vec()).await? {
-                    counter.fetch_sub(1, SeqCst);
-                    continue;
-                }
-                pending.write().await.push_back(item.clone());
+            let metadata = client
+                .get_sync_metadata_by_prefix(TrieNodePrefix {
+                    prefix: item.prefix.clone(),
+                })
+                .await?
+                .into_inner();
 
-                let req_start = Utc::now();
-                let metadata = client
-                    .get_sync_metadata_by_prefix(TrieNodePrefix {
-                        prefix: item.prefix.clone(),
-                    })
-                    .await?
-                    .into_inner();
-                let duration = (Utc::now() - req_start).num_milliseconds();
-                if duration > 500 {
-                    info!("fetched metadata [duration: {:?}ms]", duration);
-                }
-
-                if metadata.children.is_empty() {
-                    let req_start = Utc::now();
-                    let sync_ids = client
+            if metadata.children.is_empty() {
+                result_sync_ids.push(
+                    client
                         .get_all_sync_ids_by_prefix(TrieNodePrefix {
                             prefix: metadata.prefix,
                         })
                         .await?
-                        .into_inner();
-                    let duration = (Utc::now() - req_start).num_milliseconds();
-                    if duration > 350 {
-                        info!("fetched sync ids [duration: {:?}ms]", duration);
-                    }
-                    result.push(sync_ids);
-                }
+                        .into_inner(),
+                );
+            }
 
-                let mut q = queue.write().await;
-                for child in metadata.children.iter() {
-                    let child_h = blake3::hash(child.prefix.as_slice());
-                    if child.num_messages > 0 && !tree_contains(tree.clone(), child.prefix.clone()).await? {
-                        q.push_back(Item{
-                            prefix: child.prefix.clone(),
-                            hash: child_h
-                        });
-                        counter.fetch_add(1, SeqCst);
-                    }
-                }
-                drop(q);
+            let children = metadata.children.iter().map(|child| {
+                let prefix = child.prefix.clone();
+                let hash = blake3::hash(prefix.as_slice());
+                Item { prefix, hash }
+            });
+            queue.write().await.extend(children);
 
-                if metadata.num_messages <= 1 {
-                    sender.send(DbOperation::Insert {
-                        tree: tree.clone(),
-                        key: item.prefix,
-                        value: metadata.hash.as_bytes().to_vec(),
-                    }).await?;
-                }
-                sender.send(DbOperation::Insert {
+            sender
+                .send(DbOperation::Insert {
                     tree: tree.clone(),
                     key: item.hash.as_bytes().to_vec(),
                     value: vec![],
-                }).await?;
-                pending.write().await.pop_front();
-                counter.fetch_sub(1, SeqCst);
-            }
+                })
+                .await?;
+            pending_item.clear();
         }
-        Ok(result)
+
+        num_processed = result_sync_ids.len();
+        if num_processed > 0 {
+            sender
+                .send(DbOperation::DuckBatchSyncIds {
+                    source: source.clone(),
+                    sync_ids_vec: result_sync_ids,
+                })
+                .await?;
+        }
+        Ok(num_processed)
     }
 
     async fn sync_and_persist(
         endpoint: Endpoint,
         start_time: u32,
         end_time: u32,
-        tree: Arc<Tree>,
+        tree: Tree,
         sender: Sender<DbOperation>,
-    ) -> eyre::Result<SyncIds> {
-        const WORKER_POOL_SIZE: usize = 256;
+    ) -> eyre::Result<usize> {
+        const WORKER_POOL_SIZE: usize = 128;
         const TIME_WINDOW_SECONDS: u32 = 600;
         let queue = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
         let pending = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
         let mut current_time = start_time;
-        let mut sync_ids: Vec<SyncIds> = vec![];
-        let counter = Arc::new(AtomicUsize::new(0));
 
+        let source = endpoint.clone().uri().to_string();
         let client = HubServiceClient::connect(endpoint).await?;
-        while current_time >= end_time {
-            let start_time = Utc::now();
-            let mut q = queue.write().await;
-            let batch_size = TIME_WINDOW_SECONDS.min(current_time - end_time);
-            let start = current_time - batch_size;
-            let end = current_time;
-            for t in (start..end).rev() {
-                let prefix = farcaster_time_to_str(t - FARCASTER_EPOCH as u32).as_bytes().to_vec();
-                let hash = blake3::hash(prefix.as_slice());
-                q.push_back(Item{
-                    prefix,
-                    hash,
-                });
-                counter.fetch_add(1, SeqCst);
+        let mut num_processed: usize = 0;
+
+        loop {
+            let duration_start = Utc::now();
+            if current_time >= end_time {
+                let batch_size = TIME_WINDOW_SECONDS.min(current_time - end_time);
+                let start = current_time - batch_size;
+                let end = current_time;
+
+                let mut q = queue.write().await;
+                for t in (start..end).rev() {
+                    let prefix = farcaster_time_to_str(t - FARCASTER_EPOCH as u32)
+                        .as_bytes()
+                        .to_vec();
+                    let hash = blake3::hash(prefix.as_slice());
+                    q.push_back(Item { prefix, hash });
+                }
+                drop(q);
+                current_time = current_time - batch_size - 1;
             }
-            drop(q);
 
             info!("spawning {:?} workers", WORKER_POOL_SIZE);
-            let workers = (0..WORKER_POOL_SIZE).map(|_| {
-                let client = client.clone();
-                let queue = Arc::clone(&queue);
-                let pending = pending.clone();
-                let tree = tree.clone();
-                let sender = sender.clone();
-                let counter = counter.clone();
+            let workers = (0..WORKER_POOL_SIZE)
+                .map(|_| {
+                    let source = source.clone();
+                    let client = client.clone();
+                    let queue = Arc::clone(&queue);
+                    let pending = pending.clone();
+                    let tree = tree.clone();
+                    let sender = sender.clone();
 
-                tokio::task::spawn(async move {
-                    HubStateDiffer::sync_worker(client, queue, pending, tree, sender, counter).await
+                    tokio::task::spawn(async move {
+                        HubStateDiffer::sync_worker(
+                            source, client, queue, pending, tree, sender,
+                        )
+                            .await
+                    })
                 })
-            }).collect::<Vec<JoinHandle<_>>>();
+                .collect::<Vec<JoinHandle<_>>>();
 
             let results = futures::future::join_all(workers).await;
+            let mut batch_count:usize = 0;
             for result in results {
                 match result {
-                    Ok(Ok(sync_ids_result)) => {
+                    Ok(Ok(count)) => {
                         // `sync_ids` is of type `HashSet<Vec<u8>>` here, coming from the spawned task.
-                        if sync_ids_result.len() > 0 {
-                            slog_scope::info!("Task completed successfully: {:?}", sync_ids_result.len());
-                            sync_ids.extend(sync_ids_result);
-                        }
+                        num_processed += count;
+                        batch_count += count;
                     } // The task completed successfully.
                     Ok(Err(e)) => {
                         // `e` is of type `eyre::Report` here, coming from the spawned task.
                         slog_scope::error!("Task join error: {:?}", e);
+                        exit(1);
                     } // The task returned an error.
                     Err(e) => {
                         // `e` is of type `ErrReport` here, coming from the spawned task.
@@ -273,43 +508,50 @@ impl HubStateDiffer {
                 }
             }
 
-            info!("successfully processed batch of messages [duration: {:?}] [sync_ids: {:?}]",
-                Utc::now() - start_time, sync_ids.len());
+            info!(
+                "successfully processed batch of messages [duration: {:?}] [batch_processed: {:?}] [num_processed: {:?}]",
+                (Utc::now() - start_time).num_milliseconds(), batch_count, num_processed,
+            );
 
-            let mut p = pending.write().await;
-            let mut q = queue.write().await;
-            let pending_count = p.len();
-            if pending_count > 0 {
-                info!("enqueuing pending items to be processed [pending: {:?}]", pending_count);
-                while let Some(item) = p.pop_front() {
-                    q.push_back(item);
-                }
+            let num_pending = pending.read().await.len();
+            queue
+                .write()
+                .await
+                .extend(pending.write().await.drain(..num_pending));
+
+            if current_time < end_time && queue.read().await.is_empty() {
+                break;
             }
-            drop(p);
-            drop(q);
-
-            current_time = current_time - batch_size - 1;
         }
 
-        return Ok(SyncIds{
-            sync_ids: sync_ids.into_iter().flat_map(|s| s.sync_ids).collect(),
-        });
+        return Ok(num_processed);
     }
 
     // diff exhaustive will do a full scan of two hub tries
-    // to return all the messages that are missing
+    // to return all the sync IDs that are missing
     // since it is expensive, we should take the result and persist it to a file as well
-    pub async fn diff_exhaustive(self) -> eyre::Result<(Vec<Message>, Vec<Message>)> {
+    pub async fn diff_sync_ids(self) -> eyre::Result<SyncIdDiffReport> {
         let now = Utc::now();
-        let (start, end) = (now.timestamp() as u32, (now - Duration::from_days(1)).timestamp() as u32);
+        let (start, end) = (
+            now.timestamp() as u32,
+            (now - Duration::from_days(1)).timestamp() as u32,
+        );
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
-        let db_handle = spawn_tree_thread(receiver);
+
+        let source_tree_name = self.endpoint_a.uri().host().ok_or(eyre!("missing host"))?;
+        let source_tree = self.repo.open_cache_tree(source_tree_name).await?;
+
+        let target_tree_name = self.endpoint_b.uri().host().ok_or(eyre!("missing host"))?;
+        let target_tree = self.repo.open_cache_tree(target_tree_name).await?;
+
+        let db_handle = spawn_tree_thread(self.repo, receiver);
+
         let source_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_a.clone(),
             start,
             end,
-            self.tree_a.clone(),
+            source_tree,
             sender.clone(),
         ));
 
@@ -317,218 +559,26 @@ impl HubStateDiffer {
             self.endpoint_b.clone(),
             start,
             end,
-            self.tree_b.clone(),
+            target_tree,
             sender.clone(),
         ));
 
         let result = futures::future::join(source_handle, target_handle).await;
         drop(sender);
-        db_handle.await?;
+        let _ = db_handle
+            .join()
+            .map_err(|e| eyre!("error joining db thread: {:?}", e))?;
 
         let (source_sync_ids, target_sync_ids) = result;
 
-        let source: SyncIds;
-        match source_sync_ids? {
-            Ok(s) => source = s,
-            Err(e) => return Err(eyre!("error fetching source sync ids: {:?}", e)),
-        }
-
-        let target: SyncIds;
-        match target_sync_ids? {
-            Ok(s) => target = s,
-            Err(e) => return Err(eyre!("error fetching target sync ids: {:?}", e)),
-        }
-
-        save_to_file(&source, "source_sync_ids.json")?;
-        save_to_file(&target, "target_sync_ids.json")?;
-        // get all messages by sync_ids
-        let s_len = source.sync_ids.len();
-        let t_len = target.sync_ids.len();
-        slog_scope::info!("source sync ids: {:?}", s_len);
-        slog_scope::info!("target sync ids: {:?}", t_len);
-        let mut hist = Histogram::new(7, 64)?;
-        let mut missing = HashMap::new();
-        for sync_id in (&target).sync_ids.iter() {
-            if !source.sync_ids.contains(sync_id) {
-                let ts = sync_id[0..TIMESTAMP_LENGTH].to_vec();
-                let ts_str = String::from_utf8(ts).unwrap();
-                let timestamp = ts_str.parse::<u32>().unwrap();
-                missing.insert(timestamp, sync_id);
-                hist.increment(farcaster_to_unix(timestamp as u64))?;
-            }
-        }
-
-        if missing.len() == 0 {
-            info!("no missing sync ids between source and target endpoints",);
-        } else {
-            let mut v: Vec<_> = missing.into_iter().collect();
-            v.sort_by_key(|&(key, _)| key);
-            slog_scope::info!("missing: {:?}", v);
-            let sparse = histogram::SparseHistogram::from(&hist);
-            let pct = hist.percentiles(&[50.0, 75.0, 90.0, 99.0, 99.9, 99.99])?;
-            slog_scope::info!("histogram: {:?}", sparse);
-            slog_scope::info!("percentiles: {:?}", pct);
-            let median = sparse.percentile(50.0).unwrap();
-            slog_scope::info!("median: {:?} {:?}", median.start(), median.end());
-        }
-
-        let source_messages =
-            HubStateDiffer::messages_by_sync_ids(self.endpoint_a.clone(), source).await?;
-        let target_messages =
-            HubStateDiffer::messages_by_sync_ids(self.endpoint_b.clone(), target).await?;
-        info!("source messages: {:?}", source_messages.len());
-        info!("target messages: {:?}", target_messages.len());
-
-        Ok((source_messages, target_messages))
-    }
-
-    async fn messages_by_sync_ids(
-        endpoint: Endpoint,
-        sync_ids: SyncIds,
-    ) -> eyre::Result<Vec<Message>> {
-        let mut client = HubServiceClient::connect(endpoint).await?;
-        let ids = client
-            .get_all_messages_by_sync_ids(sync_ids)
-            .await?
-            .into_inner();
-        Ok(ids.messages)
-    }
-
-    async fn sync_ids(
-        input_prefix: Vec<u8>,
-        client: &mut HubServiceClient<Channel>,
-    ) -> eyre::Result<SyncIds> {
-        let mut source_sync_ids: SyncIds = SyncIds { sync_ids: vec![] };
-
-        async fn fetch_sync_ids(
-            client: &mut HubServiceClient<Channel>,
-            out: &mut SyncIds,
-            prefix: Vec<u8>,
-        ) -> eyre::Result<()> {
-            // Fetch sync ids
-            let result = client
-                .get_all_sync_ids_by_prefix(tonic::Request::new(TrieNodePrefix {
-                    prefix: prefix.clone(),
-                }))
-                .await;
-            match result {
-                Ok(sync_ids) => {
-                    out.sync_ids.extend(sync_ids.into_inner().sync_ids);
-                }
-                Err(e) => {
-                    return Err(eyre!(
-                        "error fetching sync ids for prefix {:?}: {:?}",
-                        prefix,
-                        e
-                    ))
-                }
-            }
-            Ok(())
-        }
-        let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
-        for i in 0..input_prefix.len() {
-            queue.push_back(vec![input_prefix[i]]);
-        }
-
-        let mut visited: HashSet<Vec<u8>> = HashSet::new();
-        while let Some(prefix) = queue.pop_front() {
-            if visited.contains(&prefix) {
-                continue;
-            }
-            visited.insert(prefix.clone());
-
-            if prefix.len() + 1 >= 4 {
-                continue;
-            }
-            for i in 0..input_prefix.len() {
-                let mut new_prefix = prefix.clone();
-                new_prefix.push(input_prefix[i]);
-                fetch_sync_ids(client, &mut source_sync_ids, new_prefix.clone()).await?;
-                queue.push_back(new_prefix);
-            }
-        }
-
-        Ok(source_sync_ids)
-    }
-    pub async fn _diff(self) -> eyre::Result<HashMap<u64, UnpackedSyncId>> {
-        let source_client = &mut HubServiceClient::connect(self.endpoint_a).await?;
-        let target_client = &mut HubServiceClient::connect(self.endpoint_b).await?;
-
-        let source_snap = source_client
-            .get_sync_snapshot_by_prefix(tonic::Request::new(Default::default()))
-            .await?
-            .into_inner();
-        let target_snap = target_client
-            .get_sync_snapshot_by_prefix(tonic::Request::new(Default::default()))
-            .await?
-            .into_inner();
-
-        let source_sync_ids: SyncIds =
-            HubStateDiffer::sync_ids(source_snap.prefix, source_client).await?;
-        let target_sync_ids: SyncIds =
-            HubStateDiffer::sync_ids(target_snap.prefix, target_client).await?;
-
-        let source_set: HashSet<Vec<u8>> = source_sync_ids.sync_ids.into_iter().collect();
-        let mut message_vec: HashMap<u64, UnpackedSyncId> = HashMap::new();
-        let mut fname_vec: HashMap<u64, UnpackedSyncId> = HashMap::new();
-        let mut on_chain_event_vec: HashMap<u64, UnpackedSyncId> = HashMap::new();
-
-        target_sync_ids.sync_ids.iter().for_each(|sync_id| {
-            if !source_set.contains(sync_id) {
-                let id = SyncId(sync_id.clone());
-                let timestamp_bytes = id.0[0..TIMESTAMP_LENGTH].to_vec();
-                let ts_str = String::from_utf8(timestamp_bytes).unwrap();
-                let timestamp = ts_str.parse::<u64>().unwrap();
-                let result: UnpackedSyncId = SyncId::unpack(&id.0);
-                match result {
-                    UnpackedSyncId::Message {
-                        fid,
-                        primary_key,
-                        hash,
-                    } => {
-                        message_vec.insert(
-                            timestamp,
-                            UnpackedSyncId::Message {
-                                fid,
-                                primary_key,
-                                hash,
-                            },
-                        );
-                    }
-                    UnpackedSyncId::FName { fid, name, padded } => {
-                        fname_vec.insert(timestamp, UnpackedSyncId::FName { fid, name, padded });
-                    }
-                    UnpackedSyncId::OnChainEvent {
-                        fid,
-                        event_type,
-                        block_number,
-                        log_index,
-                    } => {
-                        on_chain_event_vec.insert(
-                            timestamp,
-                            UnpackedSyncId::OnChainEvent {
-                                fid,
-                                event_type,
-                                block_number,
-                                log_index,
-                            },
-                        );
-                    }
-                    _ => {
-                        println!("unknown sync id found: {:?}", sync_id);
-                        // Do nothing
-                    }
-                }
-            }
-        });
-
-        Ok(
-            message_vec
-                .iter()
-                .chain(fname_vec.iter())
-                .chain(on_chain_event_vec.iter())
-                .map(|(k, v)| (*k, v.clone())) // Create owned versions of both keys and values
-                .collect(), // Collect into a HashMap<u64, UnpackedSyncId>
-        )
+        // Should just use the repository to get the disjoint set
+        // of sync ids because storing them in memory is way too expensive
+        // and duckdb is fast enough to return it in seconds
+        Ok(SyncIdDiffReport {
+            a: self.endpoint_a,
+            missing_from_a: SyncIds::default(),
+            b: self.endpoint_b,
+            missing_from_b: SyncIds::default(),
+        })
     }
 }

@@ -14,8 +14,9 @@ use crate::cmd::info_cmd::InfoCommand;
 use crate::cmd::messages_cmd::MessagesCommand;
 use crate::cmd::parse_cmd::ParseCommand;
 use crate::cmd::peers_cmd::PeersCommand;
+use crate::cmd::sync_ids_cmd::SyncIdsCommand;
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{Message, SyncIds, TrieNodePrefix};
+use crate::proto::{Message, TrieNodePrefix};
 
 #[derive(Debug, Args, Clone)]
 pub(crate) struct BaseConfig {
@@ -47,6 +48,7 @@ pub enum SubCommands {
     Peers(PeersCommand),
     SyncMetadata(SyncMetadataCommand),
     SyncSnapshot(SyncSnapshotCommand),
+    SyncIds(SyncIdsCommand),
     Messages(MessagesCommand),
     Parse(ParseCommand),
 }
@@ -136,6 +138,7 @@ impl Command {
                 SubCommands::Peers(peers) => peers.execute().await?,
                 SubCommands::SyncMetadata(sync_metadata) => sync_metadata.execute().await?,
                 SubCommands::SyncSnapshot(sync_snapshot) => sync_snapshot.execute()?,
+                SubCommands::SyncIds(sync_ids) => sync_ids.execute().await?,
             },
             _ => {
                 Command::command().print_help()?;

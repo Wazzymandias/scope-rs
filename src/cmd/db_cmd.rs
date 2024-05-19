@@ -5,7 +5,6 @@ use slog_scope::info;
 struct DbCmd {
     #[arg(long)]
     path: String,
-
 }
 
 impl DbCmd {
