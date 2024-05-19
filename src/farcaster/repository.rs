@@ -18,6 +18,7 @@ impl CachedRepository {
         db_conn.execute_batch(
             "\
 BEGIN;
+SET preserve_insertion_order = false;
 
 CREATE SEQUENCE IF NOT EXISTS seq_sync_id START 1;
 

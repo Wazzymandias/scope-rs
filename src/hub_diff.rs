@@ -60,9 +60,11 @@ enum DbOperation {
         source: String,
         sync_id_bytes: Vec<u8>,
     },
-    DuckBatchSyncIds {
+    BatchSyncIds {
         source: String,
         sync_ids_vec: Vec<SyncIds>,
+        cache_tree: Tree,
+        cache_entries: Vec<(Vec<u8>, Vec<u8>)>
     },
 }
 
@@ -73,16 +75,18 @@ fn spawn_tree_thread(
     return std::thread::spawn(move || {
         let conn = &mut repo.conn();
 
-        let mut sync_id_lru: LruCache<DBSyncID, u64> = LruCache::new(65536);
         while let Some(operation) = channel.blocking_recv() {
             match operation {
                 DbOperation::Insert { tree, key, value } => match tree.insert(key, value) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                    }
                     Err(e) => info!("Failed to insert key, error: {:?}", e),
                 },
-                DbOperation::DuckBatchSyncIds {
+                DbOperation::BatchSyncIds {
                     source,
                     sync_ids_vec,
+                    cache_tree,
+                    cache_entries,
                 } => {
                     let tx_result = conn.transaction();
                     let tx: Transaction;
@@ -142,7 +146,10 @@ fn spawn_tree_thread(
                             RETURNING *",
                         placeholders
                     );
-                    debug!("executing insert sync ids query: {:?}", insert_sync_ids_query);
+                    debug!(
+                        "executing insert sync ids query: {:?}",
+                        insert_sync_ids_query
+                    );
 
                     // 1. Insert the sync ids
                     let mut statement = tx.prepare(&insert_sync_ids_query).unwrap();
@@ -155,6 +162,7 @@ fn spawn_tree_thread(
                     );
                     if rows.is_err() {
                         info!("Failed to insert sync_ids, error: {:?}", rows.err());
+                        tx.rollback().unwrap();
                         continue;
                     }
 
@@ -217,7 +225,11 @@ fn spawn_tree_thread(
                                 channel.len()
                             );
                         }
-                        Err(e) => info!("Failed to insert source_sync_ids, error: {:?}", e),
+                        Err(e) => {
+                            info!("Failed to insert source_sync_ids, error: {:?}", e);
+                            tx.rollback().unwrap();
+                            continue;
+                        },
                     }
 
                     let result = tx.commit();
@@ -229,6 +241,12 @@ fn spawn_tree_thread(
                             info!("Failed to commit transaction, error: {:?}", e);
                         }
                     }
+
+                    let mut cache_batch = sled::Batch::default();
+                    for (key, value) in cache_entries {
+                        cache_batch.insert(key, value);
+                    }
+                    cache_tree.apply_batch(cache_batch).unwrap();
                 }
                 DbOperation::Duck {
                     source,
@@ -367,18 +385,14 @@ impl HubStateDiffer {
         let mut num_processed: usize = 0;
         let mut result_sync_ids: Vec<SyncIds> = vec![];
         let mut pending_item = PendingItem::new(pending);
+        let mut cache_entries = vec![];
 
         while !queue.read().await.is_empty() {
             pending_item.set(queue.write().await.pop_back());
-            let item: &Item;
-            match &pending_item.entry {
-                None => {
-                    break;
-                }
-                Some(i) => {
-                    item = i;
-                }
-            }
+            let item: &Item = match &pending_item.entry {
+                None => { break; }
+                Some(i) => i
+            };
             let exists = CachedRepository::exists_in_cache_tree(&tree, item.hash.as_bytes())?;
             if exists {
                 pending_item.clear();
@@ -410,22 +424,18 @@ impl HubStateDiffer {
             });
             queue.write().await.extend(children);
 
-            sender
-                .send(DbOperation::Insert {
-                    tree: tree.clone(),
-                    key: item.hash.as_bytes().to_vec(),
-                    value: vec![],
-                })
-                .await?;
+            cache_entries.push((item.hash.as_bytes().to_vec(), vec![]));
             pending_item.clear();
         }
 
         num_processed = result_sync_ids.len();
         if num_processed > 0 {
             sender
-                .send(DbOperation::DuckBatchSyncIds {
+                .send(DbOperation::BatchSyncIds {
                     source: source.clone(),
                     sync_ids_vec: result_sync_ids,
+                    cache_tree: tree.clone(),
+                    cache_entries,
                 })
                 .await?;
         }
@@ -439,7 +449,7 @@ impl HubStateDiffer {
         tree: Tree,
         sender: Sender<DbOperation>,
     ) -> eyre::Result<usize> {
-        const WORKER_POOL_SIZE: usize = 128;
+        const WORKER_POOL_SIZE: usize = 512;
         const TIME_WINDOW_SECONDS: u32 = 600;
         let queue = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
         let pending = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
@@ -450,6 +460,11 @@ impl HubStateDiffer {
         let mut num_processed: usize = 0;
 
         loop {
+            if sender.is_closed() {
+                info!("sender closed, cannot continue, exiting now", );
+                break;
+            }
+
             let duration_start = Utc::now();
             if current_time >= end_time {
                 let batch_size = TIME_WINDOW_SECONDS.min(current_time - end_time);
@@ -479,16 +494,14 @@ impl HubStateDiffer {
                     let sender = sender.clone();
 
                     tokio::task::spawn(async move {
-                        HubStateDiffer::sync_worker(
-                            source, client, queue, pending, tree, sender,
-                        )
+                        HubStateDiffer::sync_worker(source, client, queue, pending, tree, sender)
                             .await
                     })
                 })
                 .collect::<Vec<JoinHandle<_>>>();
 
             let results = futures::future::join_all(workers).await;
-            let mut batch_count:usize = 0;
+            let mut batch_count: usize = 0;
             for result in results {
                 match result {
                     Ok(Ok(count)) => {
@@ -499,7 +512,6 @@ impl HubStateDiffer {
                     Ok(Err(e)) => {
                         // `e` is of type `eyre::Report` here, coming from the spawned task.
                         slog_scope::error!("Task join error: {:?}", e);
-                        exit(1);
                     } // The task returned an error.
                     Err(e) => {
                         // `e` is of type `ErrReport` here, coming from the spawned task.
@@ -510,7 +522,7 @@ impl HubStateDiffer {
 
             info!(
                 "successfully processed batch of messages [duration: {:?}] [batch_processed: {:?}] [num_processed: {:?}]",
-                (Utc::now() - start_time).num_milliseconds(), batch_count, num_processed,
+                (Utc::now() - duration_start).num_milliseconds(), batch_count, num_processed,
             );
 
             let num_pending = pending.read().await.len();
@@ -531,13 +543,15 @@ impl HubStateDiffer {
     // to return all the sync IDs that are missing
     // since it is expensive, we should take the result and persist it to a file as well
     pub async fn diff_sync_ids(self) -> eyre::Result<SyncIdDiffReport> {
+        const DB_OPS_CHANNEL_SIZE: usize = 131072;
+
         let now = Utc::now();
         let (start, end) = (
             now.timestamp() as u32,
             (now - Duration::from_days(1)).timestamp() as u32,
         );
 
-        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(8192);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(DB_OPS_CHANNEL_SIZE);
 
         let source_tree_name = self.endpoint_a.uri().host().ok_or(eyre!("missing host"))?;
         let source_tree = self.repo.open_cache_tree(source_tree_name).await?;
