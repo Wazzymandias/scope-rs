@@ -1,5 +1,11 @@
+use std::sync::Arc;
+use duckdb::params;
+use prost::Message;
 use sled::Tree;
 use slog_scope::error;
+use crate::proto::SyncIds;
+
+pub const DEFAULT_CACHE_DB_DIR: &str = ".db";
 
 #[derive(Debug)]
 pub struct CachedRepository {
@@ -40,7 +46,6 @@ COMMIT;
                 ",
         )?;
 
-
         Ok(CachedRepository {
             persistent_cache_db,
             db_conn,
@@ -51,8 +56,8 @@ COMMIT;
         &self.persistent_cache_db
     }
 
-    pub fn conn(&mut self) -> &mut duckdb::Connection {
-        &mut self.db_conn
+    pub fn conn(&self) -> eyre::Result<duckdb::Connection> {
+        self.db_conn.try_clone().map_err(|e| eyre::eyre!("Error cloning duckdb connection: {:?}", e))
     }
 
     pub fn stop(self) -> eyre::Result<()> {
@@ -72,5 +77,35 @@ COMMIT;
     pub async fn open_cache_tree(&self, tree_name: &str) -> eyre::Result<Tree> {
         let tree = self.persistent_cache_db.open_tree(tree_name)?;
         Ok(tree)
+    }
+
+    pub fn sync_id_set_difference(&self, a_source: String, b_source: String) -> eyre::Result<SyncIds> {
+        let difference = "SELECT a.* FROM sync_ids a
+            INNER JOIN (
+                SELECT sync_id FROM source_sync_ids WHERE source = ?
+                EXCEPT
+                SELECT sync_id FROM source_sync_ids WHERE source = ?
+            ) sub
+            ON a.id = sub.sync_id
+            ";
+
+        let mut result = self.db_conn.prepare(&difference)?;
+        let mut rows = result.query(params![a_source, b_source]).map_err(|e| eyre::eyre!("Error querying difference: {:?}", e))?;
+        let mut sync_ids: SyncIds = SyncIds{
+            sync_ids: Vec::new(),
+        };
+        while let Some(row) = rows.next()? {
+            let timestamp_bytes: Vec<u8> = row.get(1)?;
+            let sync_id_type: u8 = row.get(2)?;
+            let data_bytes: Vec<u8> = row.get(3)?;
+
+            let mut result = Vec::new();
+            result.extend_from_slice(&timestamp_bytes);
+            result.push(sync_id_type);
+            result.extend_from_slice(&data_bytes);
+
+            sync_ids.sync_ids.push(result);
+        }
+        Ok(sync_ids)
     }
 }

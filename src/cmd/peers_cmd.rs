@@ -15,7 +15,7 @@ pub struct PeersCommand {
 
 impl PeersCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+        let tonic_endpoint = load_endpoint(&self.base)?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let request = tonic::Request::new(Empty {});
         let response = client.get_current_peers(request).await.unwrap();

@@ -10,15 +10,12 @@ pub struct MessagesCommand {
     base: BaseConfig,
 
     #[arg(long)]
-    endpoint: String,
-
-    #[arg(long)]
     sync_id: Option<String>,
 }
 
 impl MessagesCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+        let tonic_endpoint = load_endpoint(&self.base)?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let prefix = crate::cmd::cmd::parse_prefix(&self.sync_id)?;
         let response = client
@@ -34,5 +31,35 @@ impl MessagesCommand {
         }
         println!("{}", str_response.unwrap());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::cmd::BaseConfig;
+    use crate::proto::hub_service_client::HubServiceClient;
+    use crate::proto::SyncIds;
+    use eyre::eyre;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn test_messages_command() {
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let base = BaseConfig {
+                http: false,
+                https: true,
+                port: 8080,
+                endpoint: "localhost".to_string(),
+            };
+            let messages_command = MessagesCommand {
+                base,
+                sync_id: Some("test".to_string()),
+            };
+            messages_command.execute().await.unwrap();
+        });
+
+        assert!(result.is_ok());
     }
 }

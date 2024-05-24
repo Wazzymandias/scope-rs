@@ -30,13 +30,13 @@ pub(crate) struct BaseConfig {
 
     #[arg(long, default_value = "2283")]
     pub(crate) port: u16,
+
+    #[arg(long)]
+    pub(crate) endpoint: String,
 }
 
 #[derive(Parser, Debug)]
 pub struct Command {
-    #[clap(flatten)]
-    base: BaseConfig,
-
     #[command(subcommand)]
     pub(crate) subcommand: Option<SubCommands>,
 }
@@ -98,7 +98,7 @@ pub(crate) fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::
     }
 }
 
-pub(crate) fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre::Result<Endpoint> {
+pub(crate) fn load_endpoint(base_config: &BaseConfig) -> eyre::Result<Endpoint> {
     let protocol = if base_config.https {
         "https"
     } else if base_config.http {
@@ -106,7 +106,7 @@ pub(crate) fn load_endpoint(base_config: &BaseConfig, endpoint: &String) -> eyre
     } else {
         return Err(eyre!("Invalid protocol"));
     };
-    let endpoint: String = format!("{}://{}:{}", protocol, endpoint, base_config.port);
+    let endpoint: String = format!("{}://{}:{}", protocol, base_config.endpoint, base_config.port);
     if base_config.https {
         let native_certs = load_native_certs().expect("could not load native certificates");
         let mut combined_pem = Vec::new();
@@ -150,7 +150,7 @@ impl Command {
 
 impl SyncMetadataCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+        let tonic_endpoint = load_endpoint(&self.base)?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let prefix = parse_prefix(&self.prefix)?;
 
@@ -176,7 +176,7 @@ impl SyncSnapshotCommand {
     pub fn execute(&self) -> eyre::Result<()> {
         let rt = Runtime::new().unwrap();
         let result = rt.block_on(async {
-            let tonic_endpoint = load_endpoint(&self.base, &self.endpoint)?;
+            let tonic_endpoint = load_endpoint(&self.base)?;
             let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
             let prefix = parse_prefix(&self.prefix)?;
 

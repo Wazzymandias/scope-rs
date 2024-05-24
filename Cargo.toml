@@ -32,11 +32,11 @@ slog-json = "2.6.1"
 slog-scope = "4.4.0"
 futures = "0.3.30"
 chrono = "0.4.38"
-histogram = "0.10.0"
 sled = "0.34.7"
 blake3 = "1.5.1"
 duckdb = { version = "0.10.2", features = ["bundled"] }
 log = "0.4.21"
+histo = "1.0.0"
 
 [profile.dev]
 incremental = true

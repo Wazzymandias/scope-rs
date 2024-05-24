@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::format;
 use std::fs::File;
@@ -25,16 +25,18 @@ use crate::lru::LruCache;
 use duckdb::DropBehavior::Panic;
 use duckdb::{params, Connection, ToSql, Transaction};
 use eyre::eyre;
+use histo::Histogram;
 use farcaster::CachedRepository;
-use histogram::Histogram;
 use sled::{IVec, Tree};
 use slog_scope::{debug, info};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tonic::transport::{Channel, Endpoint};
+use crate::farcaster::DEFAULT_CACHE_DB_DIR;
+use crate::farcaster::sync_id::SyncIdType::{FName, Message, OnChainEvent, Unknown};
 
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{HubEventType, Message, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
+use crate::proto::{HubEventType, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
 
 const PREFIX_SET_KEY: &[u8] = b"prefix_set";
 const DUCKDB_PATH: &str = ".duckdb";
@@ -69,12 +71,10 @@ enum DbOperation {
 }
 
 fn spawn_tree_thread(
-    mut repo: CachedRepository,
+    mut conn: Connection,
     mut channel: Receiver<DbOperation>,
 ) -> std::thread::JoinHandle<eyre::Result<()>> {
     return std::thread::spawn(move || {
-        let conn = &mut repo.conn();
-
         while let Some(operation) = channel.blocking_recv() {
             match operation {
                 DbOperation::Insert { tree, key, value } => match tree.insert(key, value) {
@@ -88,7 +88,7 @@ fn spawn_tree_thread(
                     cache_tree,
                     cache_entries,
                 } => {
-                    let tx_result = conn.transaction();
+                    let tx_result = (&mut conn).transaction();
                     let tx: Transaction;
                     match tx_result {
                         Ok(t) => {
@@ -292,7 +292,8 @@ fn spawn_tree_thread(
                 }
             }
         }
-        repo.stop()
+        conn.close().unwrap();
+        Ok(())
     });
 }
 
@@ -306,10 +307,73 @@ pub struct HubStateDiffer {
 
 #[derive(Debug)]
 pub struct SyncIdDiffReport {
-    a: Endpoint,
-    missing_from_a: SyncIds,
-    b: Endpoint,
-    missing_from_b: SyncIds,
+    a: String,
+    a_total: usize,
+    pub only_in_a: SyncIds,
+
+    b: String,
+    pub only_in_b: SyncIds,
+    b_total: usize,
+}
+
+trait ParseSyncId {
+    fn id_type_from(input: &Vec<u8>) -> SyncIdType {
+        match input[TIMESTAMP_LENGTH] {
+            1 => Message,
+            2 => FName,
+            3 => OnChainEvent,
+            _ => Unknown,
+        }
+    }
+    fn id_type(&self) -> SyncIdType;
+    fn timestamp(&self) -> eyre::Result<u64>;
+    fn timestamp_from(input: &Vec<u8>) -> eyre::Result<u64> {
+        let ts_bytes = &input[..TIMESTAMP_LENGTH];
+        let ts_str = String::from_utf8(ts_bytes.to_vec())?;
+        let ts = ts_str.parse::<u32>()?;
+        Ok(farcaster_to_unix(ts as u64))
+    }
+}
+
+impl ParseSyncId for SyncId {
+    fn id_type_from(input: &Vec<u8>) -> SyncIdType {
+        match input[TIMESTAMP_LENGTH] {
+            1 => Message,
+            2 => FName,
+            3 => OnChainEvent,
+            _ => Unknown,
+        }
+    }
+
+    fn id_type(&self) -> SyncIdType {
+        Self::id_type_from(&self.0)
+    }
+
+    fn timestamp(&self) -> eyre::Result<u64> {
+        Self::timestamp_from(&self.0)
+    }
+}
+
+impl SyncIdDiffReport {
+    pub fn histogram_by_sync_id_type(ids: &SyncIds) -> eyre::Result<Histogram> {
+        let mut histogram = Histogram::with_buckets(4);
+        let id_types = ids.sync_ids.iter().map(|sync_id| SyncId::id_type_from(sync_id));
+        id_types.for_each(|id_type| {
+            info!("id_type: {:?}", id_type);
+            histogram.add(id_type as u64)
+        });
+
+        Ok(histogram)
+    }
+
+    pub fn histogram_by_timestamp(ids: &SyncIds) -> eyre::Result<Histogram> {
+        let mut histogram = Histogram::with_buckets(16);
+        let timestamps = ids.sync_ids.iter().map(|sync_id| SyncId::timestamp_from(sync_id));
+        timestamps.for_each(|timestamp| {
+            histogram.add(timestamp.unwrap())
+        });
+        Ok(histogram)
+    }
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -365,12 +429,12 @@ impl HubStateDiffer {
     }
 
     pub(crate) fn new(endpoint_a: Endpoint, endpoint_b: Endpoint) -> eyre::Result<Self> {
-        let persister = CachedRepository::new(".db".to_string(), DUCKDB_PATH.to_string())?;
+        let repo = CachedRepository::new(DEFAULT_CACHE_DB_DIR.to_string(), DUCKDB_PATH.to_string())?;
         Ok(Self {
             endpoint_a,
             endpoint_b,
             sync_id_types: vec![],
-            repo: persister,
+            repo,
         })
     }
 
@@ -453,7 +517,7 @@ impl HubStateDiffer {
         const TIME_WINDOW_SECONDS: u32 = 600;
         let queue = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
         let pending = Arc::new(tokio::sync::RwLock::new(VecDeque::new()));
-        let mut current_time = start_time;
+        let mut current_time = end_time;
 
         let source = endpoint.clone().uri().to_string();
         let client = HubServiceClient::connect(endpoint).await?;
@@ -466,8 +530,8 @@ impl HubStateDiffer {
             }
 
             let duration_start = Utc::now();
-            if current_time >= end_time {
-                let batch_size = TIME_WINDOW_SECONDS.min(current_time - end_time);
+            if current_time >= start_time {
+                let batch_size = TIME_WINDOW_SECONDS.min(current_time - start_time);
                 let start = current_time - batch_size;
                 let end = current_time;
 
@@ -531,7 +595,7 @@ impl HubStateDiffer {
                 .await
                 .extend(pending.write().await.drain(..num_pending));
 
-            if current_time < end_time && queue.read().await.is_empty() {
+            if current_time < start_time && queue.read().await.is_empty() {
                 break;
             }
         }
@@ -542,13 +606,12 @@ impl HubStateDiffer {
     // diff exhaustive will do a full scan of two hub tries
     // to return all the sync IDs that are missing
     // since it is expensive, we should take the result and persist it to a file as well
-    pub async fn diff_sync_ids(self) -> eyre::Result<SyncIdDiffReport> {
+    pub async fn diff_sync_ids(self, start_date: DateTime<Utc>, end_date: DateTime<Utc>) -> eyre::Result<SyncIdDiffReport> {
         const DB_OPS_CHANNEL_SIZE: usize = 131072;
 
-        let now = Utc::now();
         let (start, end) = (
-            now.timestamp() as u32,
-            (now - Duration::from_days(1)).timestamp() as u32,
+            start_date.timestamp() as u32,
+            end_date.timestamp() as u32,
         );
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<DbOperation>(DB_OPS_CHANNEL_SIZE);
@@ -559,7 +622,7 @@ impl HubStateDiffer {
         let target_tree_name = self.endpoint_b.uri().host().ok_or(eyre!("missing host"))?;
         let target_tree = self.repo.open_cache_tree(target_tree_name).await?;
 
-        let db_handle = spawn_tree_thread(self.repo, receiver);
+        let db_handle = spawn_tree_thread(self.repo.conn()?, receiver);
 
         let source_handle = tokio::spawn(HubStateDiffer::sync_and_persist(
             self.endpoint_a.clone(),
@@ -585,14 +648,26 @@ impl HubStateDiffer {
 
         let (source_sync_ids, target_sync_ids) = result;
 
+        let only_in_a = (&self.repo).sync_id_set_difference(
+            self.endpoint_a.clone().uri().to_string(),
+            self.endpoint_b.clone().uri().to_string(),
+        )?;
+        let only_in_b = (&self.repo).sync_id_set_difference(
+            self.endpoint_b.clone().uri().to_string(),
+            self.endpoint_a.clone().uri().to_string(),
+        )?;
+
         // Should just use the repository to get the disjoint set
         // of sync ids because storing them in memory is way too expensive
         // and duckdb is fast enough to return it in seconds
         Ok(SyncIdDiffReport {
-            a: self.endpoint_a,
-            missing_from_a: SyncIds::default(),
-            b: self.endpoint_b,
-            missing_from_b: SyncIds::default(),
+            a: self.endpoint_a.uri().to_string(),
+            only_in_a,
+            a_total: source_sync_ids??,
+
+            b: self.endpoint_b.uri().to_string(),
+            only_in_b,
+            b_total: target_sync_ids??,
         })
     }
 }
