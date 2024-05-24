@@ -317,15 +317,10 @@ pub struct SyncIdDiffReport {
 }
 
 trait ParseSyncId {
-    fn id_type_from(input: &Vec<u8>) -> SyncIdType {
-        match input[TIMESTAMP_LENGTH] {
-            1 => Message,
-            2 => FName,
-            3 => OnChainEvent,
-            _ => Unknown,
-        }
+    fn root_prefix_from(input: &Vec<u8>) -> RootPrefix {
+        RootPrefix::from_u8(input[TIMESTAMP_LENGTH])
     }
-    fn id_type(&self) -> SyncIdType;
+    fn root_prefix_type(&self) -> RootPrefix;
     fn timestamp(&self) -> eyre::Result<u64>;
     fn timestamp_from(input: &Vec<u8>) -> eyre::Result<u64> {
         let ts_bytes = &input[..TIMESTAMP_LENGTH];
@@ -336,17 +331,8 @@ trait ParseSyncId {
 }
 
 impl ParseSyncId for SyncId {
-    fn id_type_from(input: &Vec<u8>) -> SyncIdType {
-        match input[TIMESTAMP_LENGTH] {
-            1 => Message,
-            2 => FName,
-            3 => OnChainEvent,
-            _ => Unknown,
-        }
-    }
-
-    fn id_type(&self) -> SyncIdType {
-        Self::id_type_from(&self.0)
+    fn root_prefix_type(&self) -> RootPrefix {
+        Self::root_prefix_from(&self.0)
     }
 
     fn timestamp(&self) -> eyre::Result<u64> {
@@ -355,11 +341,10 @@ impl ParseSyncId for SyncId {
 }
 
 impl SyncIdDiffReport {
-    pub fn histogram_by_sync_id_type(ids: &SyncIds) -> eyre::Result<Histogram> {
-        let mut histogram = Histogram::with_buckets(4);
-        let id_types = ids.sync_ids.iter().map(|sync_id| SyncId::id_type_from(sync_id));
+    pub fn histogram_by_root_prefix(ids: &SyncIds) -> eyre::Result<Histogram> {
+        let mut histogram = Histogram::with_buckets(32);
+        let id_types = ids.sync_ids.iter().map(|sync_id| SyncId::root_prefix_from(sync_id));
         id_types.for_each(|id_type| {
-            info!("id_type: {:?}", id_type);
             histogram.add(id_type as u64)
         });
 
@@ -367,7 +352,7 @@ impl SyncIdDiffReport {
     }
 
     pub fn histogram_by_timestamp(ids: &SyncIds) -> eyre::Result<Histogram> {
-        let mut histogram = Histogram::with_buckets(16);
+        let mut histogram = Histogram::with_buckets(64);
         let timestamps = ids.sync_ids.iter().map(|sync_id| SyncId::timestamp_from(sync_id));
         timestamps.for_each(|timestamp| {
             histogram.add(timestamp.unwrap())

@@ -117,10 +117,12 @@ impl DiffCommand {
             .await
             .or_else(|e| Err(eyre!("{:?}", e)))?;
 
-        println!("{}", SyncIdDiffReport::histogram_by_sync_id_type(&sync_id_diff_report.only_in_a)?);
+        println!("-----------------------Only in Source-----------------------------");
+        println!("{}", SyncIdDiffReport::histogram_by_root_prefix(&sync_id_diff_report.only_in_a)?);
         println!("{}", SyncIdDiffReport::histogram_by_timestamp(&sync_id_diff_report.only_in_b)?);
 
-        println!("{}", SyncIdDiffReport::histogram_by_sync_id_type(&sync_id_diff_report.only_in_b)?);
+        println!("-----------------------Only in Target-----------------------------");
+        println!("{}", SyncIdDiffReport::histogram_by_root_prefix(&sync_id_diff_report.only_in_b)?);
         println!("{}", SyncIdDiffReport::histogram_by_timestamp(&sync_id_diff_report.only_in_b)?);
 
         Ok(())
