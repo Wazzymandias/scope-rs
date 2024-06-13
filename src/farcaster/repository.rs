@@ -1,6 +1,4 @@
-use std::sync::Arc;
 use duckdb::params;
-use prost::Message;
 use sled::Tree;
 use slog_scope::error;
 use crate::proto::SyncIds;

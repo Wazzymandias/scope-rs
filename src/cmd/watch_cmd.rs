@@ -6,8 +6,8 @@ use prometheus::{histogram_opts, opts, Encoder, Registry, TextEncoder};
 use slog_scope::info;
 use std::collections::HashMap;
 use std::string::ToString;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Semaphore;
@@ -63,6 +63,8 @@ type HubUniquePeers = HashMap<BaseRpcConfig, HubInfoResponse>;
 #[derive(Debug)]
 struct Metrics {
     total_messages_histogram: prometheus::Histogram,
+    unavailable_hub_count: prometheus::Gauge,
+    total_hub_count: prometheus::Gauge,
 }
 
 const CONCURRENCY_LIMIT: usize = 1024;
@@ -75,13 +77,28 @@ impl WatchCommand {
             "Total message count histogram across hubs"
         ))?;
 
+        let unavailable_hub_count = prometheus::Gauge::with_opts(opts!(
+            "unavailable_hub_count",
+            "Total number of hubs that are currently unavailable"
+        ))?;
+
+        let total_hub_count = prometheus::Gauge::with_opts(opts!(
+            "total_hub_count",
+            "Total number of hubs that are currently available"
+        ))?;
+
         let registry = prometheus::default_registry();
+
         registry.register(Box::new(total_messages_histogram.clone()))?;
+        registry.register(Box::new(unavailable_hub_count.clone()))?;
+        registry.register(Box::new(total_hub_count.clone()))?;
 
         Ok((
             registry,
             Metrics {
                 total_messages_histogram,
+                unavailable_hub_count,
+                total_hub_count,
             },
         ))
     }
@@ -141,7 +158,11 @@ impl WatchCommand {
                     let peer_conf = BaseRpcConfig::from_contact_info(&peer).await;
                     match peer_conf {
                         Err(err) => {
-                            info!("Failed to query peer {:?}: {:?}", peer.rpc_address.as_ref(), err.to_string());
+                            info!(
+                                "Failed to query peer {:?}: {:?}",
+                                peer.rpc_address.as_ref(),
+                                err.to_string()
+                            );
                             Err(err)
                         }
                         Ok(peer_conf) => {
@@ -152,25 +173,29 @@ impl WatchCommand {
                             // their connectivity / reachability
                             let peer_endpoint = peer_conf.load_endpoint()?;
                             let mut peer_client = HubServiceClient::connect(
-                                peer_endpoint.connect_timeout(Duration::from_secs(1)).timeout(Duration::from_secs(1)),
+                                peer_endpoint
+                                    .connect_timeout(Duration::from_secs(1))
+                                    .timeout(Duration::from_secs(1)),
                             )
                             .await?;
                             let peer_hub_info_response = peer_client
                                 .get_info(HubInfoRequest { db_stats: false })
                                 .await?;
                             let peer_hub_info = peer_hub_info_response.into_inner();
-                            uniq.write()
-                                .await
-                                .insert(peer_conf.clone(), peer_hub_info);
+                            uniq.write().await.insert(peer_conf.clone(), peer_hub_info);
                             Ok(())
                         }
                     }
                 }));
             }
-            info!("Finished querying peers for hub: {:?}", hub_conf.endpoint.to_string());
+            info!(
+                "Finished querying peers for hub: {:?}",
+                hub_conf.endpoint.to_string()
+            );
 
             // 4. Add hub to unique_peers
-            unique_peers.write()
+            unique_peers
+                .write()
                 .await
                 .insert(hub_conf.clone(), hub_info);
         }
@@ -179,9 +204,7 @@ impl WatchCommand {
         let results = futures::future::join_all(peer_handles).await;
         for result in results {
             match result {
-                Ok(result) => {
-
-                }
+                Ok(result) => {}
                 Err(err) => {
                     info!("Failed to query peer: {:?}", err.to_string());
                 }
@@ -193,13 +216,9 @@ impl WatchCommand {
         }
 
         return match Arc::try_unwrap(unique_peers) {
-            Ok(rwlock) => {
-                Ok(tokio::sync::RwLock::into_inner(rwlock))
-            }
-            Err(_) => {
-                Err(eyre!("Failed to unwrap unique peers"))
-            }
-        }
+            Ok(rwlock) => Ok(tokio::sync::RwLock::into_inner(rwlock)),
+            Err(_) => Err(eyre!("Failed to unwrap unique peers")),
+        };
     }
 
     pub async fn execute(&self) -> eyre::Result<()> {
@@ -227,7 +246,7 @@ impl WatchCommand {
             return Err(eyre!("No peers found"));
         }
 
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
         loop {
             tokio::select! {
                 _ = interval.tick() => {

@@ -1,12 +1,8 @@
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::format;
 use std::fs::File;
 use std::hash::Hash;
 use std::io::BufWriter;
-use std::path::Path;
-use std::process::exit;
-use std::rc::Rc;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,8 +17,6 @@ use crate::farcaster::time::{
     farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, str_bytes_to_unix_time,
     FARCASTER_EPOCH,
 };
-use crate::lru::LruCache;
-use duckdb::DropBehavior::Panic;
 use duckdb::{params, Connection, ToSql, Transaction};
 use eyre::eyre;
 use histo::Histogram;
@@ -53,15 +47,6 @@ struct DBSyncID {
 
 #[derive(Debug)]
 enum DbOperation {
-    Insert {
-        tree: Tree,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Duck {
-        source: String,
-        sync_id_bytes: Vec<u8>,
-    },
     BatchSyncIds {
         source: String,
         sync_ids_vec: Vec<SyncIds>,
@@ -77,11 +62,6 @@ fn spawn_tree_thread(
     return std::thread::spawn(move || {
         while let Some(operation) = channel.blocking_recv() {
             match operation {
-                DbOperation::Insert { tree, key, value } => match tree.insert(key, value) {
-                    Ok(_) => {
-                    }
-                    Err(e) => info!("Failed to insert key, error: {:?}", e),
-                },
                 DbOperation::BatchSyncIds {
                     source,
                     sync_ids_vec,
@@ -248,48 +228,6 @@ fn spawn_tree_thread(
                     }
                     cache_tree.apply_batch(cache_batch).unwrap();
                 }
-                DbOperation::Duck {
-                    source,
-                    sync_id_bytes,
-                } => {
-                    let (timestamp_bytes, rest) = sync_id_bytes.split_at(10);
-
-                    if rest.len() < 1 {
-                        info!("Skipping sync_id: {:?}", sync_id_bytes);
-                        continue;
-                    }
-                    let sync_id = DBSyncID {
-                        timestamp_bytes: timestamp_bytes.to_vec(),
-                        sync_id_type: rest[0],
-                        data_bytes: rest[1..].to_vec(),
-                    };
-                    // Insert the sync_id and association in a single execution using CTE
-                    let result = conn.execute(
-                        "INSERT INTO sync_ids (timestamp_prefix, sync_id_type, data_bytes)
-                VALUES (?, ?, ?)",
-                        params![
-                            sync_id.timestamp_bytes,
-                            &sync_id.sync_id_type,
-                            &sync_id.data_bytes,
-                        ],
-                    );
-
-                    match result {
-                        Ok(_) => {}
-                        Err(e) => info!("Failed to insert sync_id, error: {:?}", e),
-                    }
-
-                    let result = conn.execute(
-                        "INSERT INTO source_sync_ids (source, sync_id) \
-                        VALUES (?, currval('seq_sync_id'))",
-                        params![&source],
-                    );
-
-                    match result {
-                        Ok(_) => {}
-                        Err(e) => info!("Failed to insert source_sync_ids, error: {:?}", e),
-                    }
-                }
             }
         }
         conn.close().unwrap();
@@ -307,13 +245,9 @@ pub struct HubStateDiffer {
 
 #[derive(Debug)]
 pub struct SyncIdDiffReport {
-    a: String,
-    a_total: usize,
     pub only_in_a: SyncIds,
 
-    b: String,
     pub only_in_b: SyncIds,
-    b_total: usize,
 }
 
 trait ParseSyncId {
@@ -631,8 +565,6 @@ impl HubStateDiffer {
             .join()
             .map_err(|e| eyre!("error joining db thread: {:?}", e))?;
 
-        let (source_sync_ids, target_sync_ids) = result;
-
         let only_in_a = (&self.repo).sync_id_set_difference(
             self.endpoint_a.clone().uri().to_string(),
             self.endpoint_b.clone().uri().to_string(),
@@ -646,13 +578,8 @@ impl HubStateDiffer {
         // of sync ids because storing them in memory is way too expensive
         // and duckdb is fast enough to return it in seconds
         Ok(SyncIdDiffReport {
-            a: self.endpoint_a.uri().to_string(),
             only_in_a,
-            a_total: source_sync_ids??,
-
-            b: self.endpoint_b.uri().to_string(),
             only_in_b,
-            b_total: target_sync_ids??,
         })
     }
 }

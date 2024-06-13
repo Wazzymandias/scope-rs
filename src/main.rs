@@ -20,7 +20,6 @@ mod db;
 mod farcaster;
 mod hub_diff;
 mod deque;
-mod lru;
 mod signals;
 
 fn create_logger() -> Logger {
