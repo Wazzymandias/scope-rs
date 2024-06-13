@@ -8,7 +8,7 @@ use crate::farcaster::time::{farcaster_to_unix, FARCASTER_EPOCH};
 #[derive(Debug, Parser)]
 pub struct ParseCommand {
     #[clap(flatten)]
-    base: crate::cmd::cmd::BaseConfig,
+    base: crate::cmd::cmd::BaseRpcConfig,
 
     #[clap(subcommand)]
     subcommand: SubCommands,

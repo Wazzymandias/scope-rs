@@ -3,7 +3,7 @@ use clap::Args;
 use eyre::eyre;
 use slog_scope::info;
 
-use crate::cmd::cmd::BaseConfig;
+use crate::cmd::cmd::BaseRpcConfig;
 use crate::hub_diff::{HubStateDiffer, SyncIdDiffReport};
 
 #[derive(Args, Debug)]
@@ -94,14 +94,14 @@ pub struct DiffCommand {
 impl DiffCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
         let source_endpoint =
-            crate::cmd::cmd::load_endpoint(&BaseConfig{
+            crate::cmd::cmd::load_endpoint(&BaseRpcConfig {
                 http: self.source.source_http,
                 https: self.source.source_https,
                 port: self.source.source_port,
                 endpoint: self.source.source_endpoint.clone(),
             })?;
         let target_endpoint =
-            crate::cmd::cmd::load_endpoint(&BaseConfig{
+            crate::cmd::cmd::load_endpoint(&BaseRpcConfig {
                 http: self.target.target_http,
                 https: self.target.target_https,
                 port: self.target.target_port,

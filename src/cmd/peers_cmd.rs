@@ -1,4 +1,4 @@
-use crate::cmd::cmd::{load_endpoint, BaseConfig};
+use crate::cmd::cmd::{load_endpoint, BaseRpcConfig};
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::Empty;
 use clap::Args;
@@ -7,10 +7,7 @@ use eyre::eyre;
 #[derive(Args, Debug)]
 pub struct PeersCommand {
     #[clap(flatten)]
-    base: BaseConfig,
-
-    #[arg(long)]
-    endpoint: String,
+    base: BaseRpcConfig,
 }
 
 impl PeersCommand {

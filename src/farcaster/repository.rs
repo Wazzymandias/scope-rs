@@ -79,6 +79,22 @@ COMMIT;
         Ok(tree)
     }
 
+    pub fn insert_sync_ids_with_source(self, source: String, sync_ids: SyncIds) -> eyre::Result<()> {
+        let mut insert_sync_id = self.db_conn.prepare("INSERT INTO sync_ids (timestamp_prefix, sync_id_type, data_bytes) VALUES (?, ?, ?)")?;
+        let mut insert_source_sync_id = self.db_conn.prepare("INSERT INTO source_sync_ids (source, sync_id) VALUES (?, ?)")?;
+
+        for sync_id in sync_ids.sync_ids {
+            let timestamp_prefix = sync_id[0..8].to_vec();
+            let sync_id_type = sync_id[8];
+            let data_bytes = sync_id[9..].to_vec();
+
+            let result = insert_sync_id.execute(params![timestamp_prefix, sync_id_type, data_bytes])?;
+            let sync_id_id = result + 1;
+
+            insert_source_sync_id.execute(params![source, sync_id_id])?;
+        }
+        Ok(())
+    }
     pub fn sync_id_set_difference(&self, a_source: String, b_source: String) -> eyre::Result<SyncIds> {
         let difference = "SELECT a.* FROM sync_ids a
             INNER JOIN (

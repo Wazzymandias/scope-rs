@@ -21,6 +21,7 @@ mod farcaster;
 mod hub_diff;
 mod deque;
 mod lru;
+mod signals;
 
 fn create_logger() -> Logger {
     let drain = Json::new(std::io::stdout())
@@ -43,6 +44,7 @@ fn main() {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .max_blocking_threads(1024)  // Increase the blocking thread pool size
         .build()
         .unwrap();

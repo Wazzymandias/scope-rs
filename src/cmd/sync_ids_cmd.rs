@@ -5,7 +5,7 @@ use eyre::eyre;
 #[derive(Debug, Args)]
 pub(crate) struct SyncIdsCommand {
     #[clap(flatten)]
-    base: crate::cmd::cmd::BaseConfig,
+    base: crate::cmd::cmd::BaseRpcConfig,
 
     #[arg(long)]
     prefix: String,

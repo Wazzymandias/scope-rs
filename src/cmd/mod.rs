@@ -6,3 +6,4 @@ mod messages_cmd;
 mod parse_cmd;
 mod peers_cmd;
 mod sync_ids_cmd;
+mod watch_cmd;

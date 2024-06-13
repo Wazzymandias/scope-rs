@@ -1,13 +1,16 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::str::FromStr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, CommandFactory, Parser};
 use eyre::eyre;
 use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+use crate::cmd::cmd::SubCommands::Parse;
 
 use crate::cmd::diff_cmd::DiffCommand;
 use crate::cmd::info_cmd::InfoCommand;
@@ -15,11 +18,12 @@ use crate::cmd::messages_cmd::MessagesCommand;
 use crate::cmd::parse_cmd::ParseCommand;
 use crate::cmd::peers_cmd::PeersCommand;
 use crate::cmd::sync_ids_cmd::SyncIdsCommand;
+use crate::cmd::watch_cmd::WatchCommand;
+use crate::proto::{ContactInfoContentBody, Message, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{Message, TrieNodePrefix};
 
-#[derive(Debug, Args, Clone)]
-pub(crate) struct BaseConfig {
+#[derive(Debug, Args, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BaseRpcConfig {
     #[arg(long)]
     #[arg(default_value = "true")]
     pub(crate) http: bool,
@@ -33,6 +37,59 @@ pub(crate) struct BaseConfig {
 
     #[arg(long)]
     pub(crate) endpoint: String,
+}
+
+impl BaseRpcConfig {
+    pub fn load_endpoint(&self) -> eyre::Result<Endpoint> {
+        load_endpoint(self)
+    }
+    pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<Self> {
+        match contact_info.rpc_address.as_ref() {
+            None => Err(eyre!("No rpc address found")),
+            Some(rpc_info) => {
+                let https_conf = BaseRpcConfig {
+                    http: false,
+                    https: true,
+                    port: rpc_info.port as u16,
+                    endpoint: rpc_info.address.clone(),
+                };
+                let http_conf = BaseRpcConfig {
+                    http: true,
+                    https: false,
+                    port: rpc_info.port as u16,
+                    endpoint: rpc_info.address.clone(),
+                };
+
+                let http_result = load_endpoint(&http_conf);
+                let http_error = match http_result {
+                    Ok(endpoint) => {
+                        endpoint.connect_timeout(Duration::from_secs(4))
+                            .connect()
+                            .await
+                            .map_err(|err| eyre!("Failed to connect to http endpoint: {:?}", err))
+                    }
+                    Err(e) => Err(e),
+                };
+
+                match http_error {
+                    Ok(_) => Ok(http_conf),
+                    Err(http_err) => {
+                        let https_result = load_endpoint(&https_conf);
+                        match https_result {
+                            Ok(endpoint) => {
+                                endpoint.connect_timeout(Duration::from_secs(4))
+                                    .connect()
+                                    .await
+                                    .map(|_| https_conf)
+                                    .map_err(|err| eyre!("Failed to connect to https endpoint: {:?}, http endpoint: {:?}", err, http_err))
+                            },
+                            Err(https_err) => Err(eyre!("Failed to connect to http endpoint: {:?}, https endpoint: {:?}", http_err, https_err)),
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -51,12 +108,13 @@ pub enum SubCommands {
     SyncIds(SyncIdsCommand),
     Messages(MessagesCommand),
     Parse(ParseCommand),
+    Watch(WatchCommand),
 }
 
 #[derive(Args, Debug)]
 pub struct SyncMetadataCommand {
     #[clap(flatten)]
-    base: BaseConfig,
+    base: BaseRpcConfig,
 
     #[arg(long)]
     endpoint: String,
@@ -72,14 +130,14 @@ pub struct SyncMetadataCommand {
 #[derive(Args, Debug)]
 pub struct SyncSnapshotCommand {
     #[clap(flatten)]
-    base: BaseConfig,
+    base: BaseRpcConfig,
 
     #[arg(long)]
     endpoint: String,
 
     /// Sets the prefix as a comma-separated string of bytes, e.g., --prefix 48,48,51
     #[arg(long)]
-    prefix: Option<String>, // Use Option if prefix is optional
+    prefix: Option<String>,
 }
 
 // convert comma separated string into Vec<u8>
@@ -98,7 +156,27 @@ pub(crate) fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::
     }
 }
 
-pub(crate) fn load_endpoint(base_config: &BaseConfig) -> eyre::Result<Endpoint> {
+static TLS_CONFIG: OnceLock<ClientTlsConfig> = OnceLock::new();
+
+fn initialize_tls_config() -> ClientTlsConfig {
+    let native_certs = load_native_certs().expect("could not load native certificates");
+    let mut combined_pem = Vec::new();
+    for cert in native_certs {
+        writeln!(&mut combined_pem, "-----BEGIN CERTIFICATE-----").unwrap();
+        writeln!(&mut combined_pem, "{}", STANDARD.encode(&cert.to_vec())).unwrap();
+        writeln!(&mut combined_pem, "-----END CERTIFICATE-----").unwrap();
+    }
+
+    let cert: Certificate = Certificate::from_pem(combined_pem);
+    ClientTlsConfig::new().ca_certificate(cert)
+}
+
+fn get_tls_config() -> &'static ClientTlsConfig {
+    TLS_CONFIG.get_or_init(initialize_tls_config)
+}
+
+
+pub(crate) fn load_endpoint(base_config: &BaseRpcConfig) -> eyre::Result<Endpoint> {
     let protocol = if base_config.https {
         "https"
     } else if base_config.http {
@@ -106,21 +184,15 @@ pub(crate) fn load_endpoint(base_config: &BaseConfig) -> eyre::Result<Endpoint> 
     } else {
         return Err(eyre!("Invalid protocol"));
     };
-    let endpoint: String = format!("{}://{}:{}", protocol, base_config.endpoint, base_config.port);
-    if base_config.https {
-        let native_certs = load_native_certs().expect("could not load native certificates");
-        let mut combined_pem = Vec::new();
-        for cert in native_certs {
-            writeln!(&mut combined_pem, "-----BEGIN CERTIFICATE-----").unwrap();
-            writeln!(&mut combined_pem, "{}", STANDARD.encode(&cert.to_vec())).unwrap();
-            writeln!(&mut combined_pem, "-----END CERTIFICATE-----").unwrap();
-        }
+    let endpoint: String = format!(
+        "{}://{}:{}",
+        protocol, base_config.endpoint, base_config.port
+    );
 
-        let cert: Certificate = Certificate::from_pem(combined_pem);
-        let tls_config = ClientTlsConfig::new().ca_certificate(cert);
+    if base_config.https {
         Ok(Endpoint::from_str(endpoint.as_str())
             .unwrap()
-            .tls_config(tls_config)
+            .tls_config(get_tls_config().clone())
             .unwrap())
     } else {
         Ok(Endpoint::from_str(endpoint.as_str()).unwrap())
@@ -139,6 +211,7 @@ impl Command {
                 SubCommands::SyncMetadata(sync_metadata) => sync_metadata.execute().await?,
                 SubCommands::SyncSnapshot(sync_snapshot) => sync_snapshot.execute()?,
                 SubCommands::SyncIds(sync_ids) => sync_ids.execute().await?,
+                SubCommands::Watch(watch) => watch.execute().await?,
             },
             _ => {
                 Command::command().print_help()?;

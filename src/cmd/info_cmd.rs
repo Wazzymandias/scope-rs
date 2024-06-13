@@ -6,7 +6,7 @@ use eyre::eyre;
 #[derive(Args, Debug)]
 pub struct InfoCommand {
     #[clap(flatten)]
-    base: crate::cmd::cmd::BaseConfig,
+    base: crate::cmd::cmd::BaseRpcConfig,
 }
 
 impl InfoCommand {

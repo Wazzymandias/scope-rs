@@ -124,7 +124,7 @@ fn spawn_tree_thread(
                                 timestamp_bytes: timestamp_bytes.to_vec(),
                                 sync_id_type: rest[0],
                                 data_bytes: rest[1..].to_vec(),
-                            }
+                           }
                         })
                         .collect();
 
@@ -521,7 +521,7 @@ impl HubStateDiffer {
                 let end = current_time;
 
                 let mut q = queue.write().await;
-                for t in (start..end).rev() {
+                for t in (start..end + 1).rev() {
                     let prefix = farcaster_time_to_str(t - FARCASTER_EPOCH as u32)
                         .as_bytes()
                         .to_vec();
