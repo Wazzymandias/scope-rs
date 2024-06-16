@@ -59,12 +59,20 @@ pub struct WatchCommand {
     duration: Option<usize>,
 }
 
+enum HubStatus {
+    Available,
+    Unavailable,
+    Intermittent, // Intermittent connectivity issues
+    
+}
+
 type HubUniquePeers = HashMap<BaseRpcConfig, HubInfoResponse>;
 #[derive(Debug)]
 struct Metrics {
+    peers_per_hub: prometheus::Histogram,
+    total_hub_count: prometheus::Gauge,
     total_messages_histogram: prometheus::Histogram,
     unavailable_hub_count: prometheus::Gauge,
-    total_hub_count: prometheus::Gauge,
 }
 
 const CONCURRENCY_LIMIT: usize = 1024;
