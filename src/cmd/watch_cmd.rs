@@ -91,6 +91,45 @@ impl WatchServer {
         })
     }
 
+    async fn run(&self) -> eyre::Result<()> {
+        let mut poll_interval = tokio::time::interval(self.poll_interval_duration);
+
+        loop {
+            tokio::select! {
+                _ = self.notify.notified() => {
+                    break;
+                },
+            _ = poll_interval.tick() => {
+                info!("Poll interval ticked", );
+                self.watch_peers().await?;
+            }
+            }
+        }
+        let watch_peers_handle = self.watch_peers().await;
+        let metrics_registry = self.metrics_registry.clone();
+        let metrics_route = path!("metrics").and(get()).map(move || {
+            let metric_families = metrics_registry.gather();
+            let mut buffer = Vec::new();
+            let encoder = TextEncoder::new();
+            encoder
+                .encode(&metric_families, &mut buffer)
+                .expect("Failed to encode metrics");
+            Response::builder()
+                .header("Content-Type", encoder.format_type())
+                .body(buffer)
+        });
+
+        let routes = metrics_route.with(warp::log("farcaster::watch"));
+        warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+
+        watch_peers_handle.await?;
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        self.notify.notify_waiters();
+    }
+
     async fn initialize_metrics() -> eyre::Result<(&'static Registry, Metrics)> {
         let peers_per_hub = prometheus::Histogram::with_opts(histogram_opts!(
             "peers_per_hub",
@@ -129,25 +168,21 @@ impl WatchServer {
         ))
     }
 
-    pub(crate) async fn run(&self) -> eyre::Result<()> {
-        let mut poll_interval = tokio::time::interval(self.poll_interval_duration);
-        let notify = Arc::clone(&self.notify);
-        tokio::select! {
-            _ = notify.notified() => {
-                info!("Received notification to stop watching", );
-            },
-            _ = poll_interval.tick() => {
-                info!("Poll interval ticked", );
-                self.watch_peers().await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn stop(&self) {
-        self.notify.notify_one();
-    }
+    // pub(crate) async fn run(&self) -> eyre::Result<()> {
+    //     let mut poll_interval = tokio::time::interval(self.poll_interval_duration);
+    //     let notify = Arc::clone(&self.notify);
+    //     tokio::select! {
+    //         _ = notify.notified() => {
+    //             info!("Received notification to stop watching", );
+    //         },
+    //         _ = poll_interval.tick() => {
+    //             info!("Poll interval ticked", );
+    //             self.watch_peers().await?;
+    //         }
+    //     }
+    //
+    //     Ok(())
+    // }
 
     async fn poll_bootstrap_peers(&self) -> eyre::Result<()> {
         let bootstrap_peer_configs = default_mainnet_bootstrap_peers();
