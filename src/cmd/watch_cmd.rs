@@ -105,7 +105,6 @@ impl WatchServer {
             }
             }
         }
-        let watch_peers_handle = self.watch_peers().await;
         let metrics_registry = self.metrics_registry.clone();
         let metrics_route = path!("metrics").and(get()).map(move || {
             let metric_families = metrics_registry.gather();
@@ -122,7 +121,6 @@ impl WatchServer {
         let routes = metrics_route.with(warp::log("farcaster::watch"));
         warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 
-        watch_peers_handle.await?;
         Ok(())
     }
 
