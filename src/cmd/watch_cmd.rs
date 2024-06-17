@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::transport::Endpoint;
 use tonic::Request;
@@ -59,14 +59,88 @@ pub struct WatchCommand {
     duration: Option<usize>,
 }
 
+struct WatchServer {
+    notify: Arc<Notify>,
+    metrics: Arc<Metrics>,
+    metrics_registry: &'static Registry,
+}
+
+impl WatchServer {
+    async fn new() -> eyre::Result<Self> {
+        let (registry, metrics) = WatchServer::initialize_metrics().await?;
+
+        Ok(WatchServer {
+            notify: Arc::new(Notify::new()),
+            metrics: Arc::new(metrics),
+            metrics_registry: registry,
+        })
+    }
+
+    async fn initialize_metrics() -> eyre::Result<(&'static Registry, Metrics)> {
+        let peers_per_hub = prometheus::Histogram::with_opts(histogram_opts!(
+            "peers_per_hub",
+            "Number of peers per hub"
+        ))?;
+
+        let total_hub_count = prometheus::Gauge::with_opts(opts!(
+            "total_hub_count",
+            "Total number of hubs that are currently available"
+        ))?;
+
+        let total_messages_histogram = prometheus::Histogram::with_opts(histogram_opts!(
+            "total_messages_histogram",
+            "Total message count histogram across hubs"
+        ))?;
+
+        let unavailable_hub_count = prometheus::Gauge::with_opts(opts!(
+            "unavailable_hub_count",
+            "Total number of hubs that are currently unavailable"
+        ))?;
+
+        let registry = prometheus::default_registry();
+
+        registry.register(Box::new(total_messages_histogram.clone()))?;
+        registry.register(Box::new(unavailable_hub_count.clone()))?;
+        registry.register(Box::new(total_hub_count.clone()))?;
+
+        Ok((
+            registry,
+            Metrics {
+                peers_per_hub,
+                total_hub_count,
+                total_messages_histogram,
+                unavailable_hub_count,
+            },
+        ))
+    }
+
+    async fn watch_peers(&self) -> JoinHandle<()> {
+        let notify = self.notify.clone();
+        return tokio::task::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {
+                        break;
+                    },
+                    _ = signal::ctrl_c() => {
+                        println!("Received Ctrl-C, exiting");
+                        break;
+                    }
+                }
+            }
+
+        });
+    }
+}
+
 enum HubStatus {
     Available,
     Unavailable,
     Intermittent, // Intermittent connectivity issues
-    
 }
 
 type HubUniquePeers = HashMap<BaseRpcConfig, HubInfoResponse>;
+
 #[derive(Debug)]
 struct Metrics {
     peers_per_hub: prometheus::Histogram,
@@ -79,38 +153,6 @@ const CONCURRENCY_LIMIT: usize = 1024;
 static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
 
 impl WatchCommand {
-    async fn initialize_metrics() -> eyre::Result<(&'static Registry, Metrics)> {
-        let total_messages_histogram = prometheus::Histogram::with_opts(histogram_opts!(
-            "total_messages_histogram",
-            "Total message count histogram across hubs"
-        ))?;
-
-        let unavailable_hub_count = prometheus::Gauge::with_opts(opts!(
-            "unavailable_hub_count",
-            "Total number of hubs that are currently unavailable"
-        ))?;
-
-        let total_hub_count = prometheus::Gauge::with_opts(opts!(
-            "total_hub_count",
-            "Total number of hubs that are currently available"
-        ))?;
-
-        let registry = prometheus::default_registry();
-
-        registry.register(Box::new(total_messages_histogram.clone()))?;
-        registry.register(Box::new(unavailable_hub_count.clone()))?;
-        registry.register(Box::new(total_hub_count.clone()))?;
-
-        Ok((
-            registry,
-            Metrics {
-                total_messages_histogram,
-                unavailable_hub_count,
-                total_hub_count,
-            },
-        ))
-    }
-
     async fn initialize_peers() -> eyre::Result<HubUniquePeers> {
         let bootstrap_peer_configs = default_mainnet_bootstrap_peers();
 
@@ -229,20 +271,21 @@ impl WatchCommand {
         };
     }
 
-    pub async fn execute(&self) -> eyre::Result<()> {
-        let (registry, metrics) = WatchCommand::initialize_metrics().await?;
 
-        let metrics_route = path!("metrics").and(get()).map(move || {
-            let metric_families = registry.gather();
-            let mut buffer = Vec::new();
-            let encoder = TextEncoder::new();
-            encoder
-                .encode(&metric_families, &mut buffer)
-                .expect("Failed to encode metrics");
-            Response::builder()
-                .header("Content-Type", encoder.format_type())
-                .body(buffer)
-        });
+    pub async fn execute(&self) -> eyre::Result<()> {
+        // let (registry, metrics) = WatchCommand::initialize_metrics().await?;
+        //
+        // let metrics_route = path!("metrics").and(get()).map(move || {
+        //     let metric_families = registry.gather();
+        //     let mut buffer = Vec::new();
+        //     let encoder = TextEncoder::new();
+        //     encoder
+        //         .encode(&metric_families, &mut buffer)
+        //         .expect("Failed to encode metrics");
+        //     Response::builder()
+        //         .header("Content-Type", encoder.format_type())
+        //         .body(buffer)
+        // });
 
         let unique_peers: HubUniquePeers = WatchCommand::initialize_peers().await?;
         info!(
