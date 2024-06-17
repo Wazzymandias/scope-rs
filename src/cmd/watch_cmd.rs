@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Interval;
 use tonic::transport::Endpoint;
 use tonic::Request;
 use warp::http::Response;
@@ -20,6 +21,8 @@ use warp::{get, path, Filter};
 use crate::cmd::cmd::BaseRpcConfig;
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{ContactInfoContentBody, HubInfoRequest, HubInfoResponse};
+
+const MINIMUM_POLL_INTERVAL_MS: u32 = 200;
 
 fn default_mainnet_bootstrap_peers() -> [BaseRpcConfig; 4] {
     [
@@ -63,16 +66,28 @@ struct WatchServer {
     notify: Arc<Notify>,
     metrics: Arc<Metrics>,
     metrics_registry: &'static Registry,
+
+    poll_interval_duration: Duration,
+
+    unique_peers: Arc<tokio::sync::RwLock<HubUniquePeers>>,
 }
 
 impl WatchServer {
-    async fn new() -> eyre::Result<Self> {
+    async fn new(notify: Arc<Notify>, poll_interval_ms: u32) -> eyre::Result<Self> {
+        if poll_interval_ms < MINIMUM_POLL_INTERVAL_MS {
+            return Err(eyre!(format!(
+                "Poll interval must be at least {} ms",
+                MINIMUM_POLL_INTERVAL_MS)));
+        }
         let (registry, metrics) = WatchServer::initialize_metrics().await?;
 
         Ok(WatchServer {
-            notify: Arc::new(Notify::new()),
+            notify,
             metrics: Arc::new(metrics),
             metrics_registry: registry,
+            poll_interval_duration: Duration::from_millis(
+                poll_interval_ms as u64),
+            unique_peers: Arc::new(tokio::sync::RwLock::new(HubUniquePeers::new())),
         })
     }
 
@@ -114,51 +129,29 @@ impl WatchServer {
         ))
     }
 
-    async fn watch_peers(&self) -> JoinHandle<()> {
-        let notify = self.notify.clone();
-        return tokio::task::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = notify.notified() => {
-                        break;
-                    },
-                    _ = signal::ctrl_c() => {
-                        println!("Received Ctrl-C, exiting");
-                        break;
-                    }
-                }
+    pub(crate) async fn run(&self) -> eyre::Result<()> {
+        let mut poll_interval = tokio::time::interval(self.poll_interval_duration);
+        let notify = Arc::clone(&self.notify);
+        tokio::select! {
+            _ = notify.notified() => {
+                info!("Received notification to stop watching", );
+            },
+            _ = poll_interval.tick() => {
+                info!("Poll interval ticked", );
+                self.watch_peers().await?;
             }
+        }
 
-        });
+        Ok(())
     }
-}
 
-enum HubStatus {
-    Available,
-    Unavailable,
-    Intermittent, // Intermittent connectivity issues
-}
+    pub(crate) async fn stop(&self) {
+        self.notify.notify_one();
+    }
 
-type HubUniquePeers = HashMap<BaseRpcConfig, HubInfoResponse>;
-
-#[derive(Debug)]
-struct Metrics {
-    peers_per_hub: prometheus::Histogram,
-    total_hub_count: prometheus::Gauge,
-    total_messages_histogram: prometheus::Histogram,
-    unavailable_hub_count: prometheus::Gauge,
-}
-
-const CONCURRENCY_LIMIT: usize = 1024;
-static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
-
-impl WatchCommand {
-    async fn initialize_peers() -> eyre::Result<HubUniquePeers> {
+    async fn poll_bootstrap_peers(&self) -> eyre::Result<()> {
         let bootstrap_peer_configs = default_mainnet_bootstrap_peers();
-
-        let mut peer_handles = FuturesUnordered::new();
-        let unique_peers = Arc::new(tokio::sync::RwLock::new(HubUniquePeers::new()));
-
+        let peer_handles = FuturesUnordered::new();
         for hub_conf in bootstrap_peer_configs.iter() {
             // 1. Query bootstrap node for hub info
             let endpoint = hub_conf.load_endpoint()?;
@@ -201,7 +194,7 @@ impl WatchCommand {
             // 3. For each peer, add to unique_peers
             for peer in hub_peers.contacts.iter() {
                 let peer = peer.clone();
-                let uniq = Arc::clone(&unique_peers);
+                let uniq = Arc::clone(&self.unique_peers);
                 peer_handles.push(tokio::task::spawn(async move {
                     let _permit = SEMAPHORE.acquire().await.unwrap();
                     // 3.1 Convert ContactInfoContentBody to BaseRpcConfig
@@ -227,7 +220,7 @@ impl WatchCommand {
                                     .connect_timeout(Duration::from_secs(1))
                                     .timeout(Duration::from_secs(1)),
                             )
-                            .await?;
+                                .await?;
                             let peer_hub_info_response = peer_client
                                 .get_info(HubInfoRequest { db_stats: false })
                                 .await?;
@@ -238,40 +231,40 @@ impl WatchCommand {
                     }
                 }));
             }
-            info!(
-                "Finished querying peers for hub: {:?}",
-                hub_conf.endpoint.to_string()
-            );
-
-            // 4. Add hub to unique_peers
-            unique_peers
-                .write()
-                .await
-                .insert(hub_conf.clone(), hub_info);
         }
-
-        info!("Waiting for peer queries to complete",);
-        let results = futures::future::join_all(peer_handles).await;
-        for result in results {
-            match result {
-                Ok(result) => {}
-                Err(err) => {
-                    info!("Failed to query peer: {:?}", err.to_string());
-                }
-            }
-        }
-
-        if unique_peers.read().await.is_empty() {
-            return Err(eyre!("No peers found"));
-        }
-
-        return match Arc::try_unwrap(unique_peers) {
-            Ok(rwlock) => Ok(tokio::sync::RwLock::into_inner(rwlock)),
-            Err(_) => Err(eyre!("Failed to unwrap unique peers")),
-        };
+        Ok(())
     }
 
+    async fn watch_peers(&self) -> eyre::Result<()> {
+        let mut peer_handles = FuturesUnordered::new();
+        peer_handles.push(tokio::task::spawn(async {
+            let bootstrap_peer_configs = default_mainnet_bootstrap_peers();
+        }));
 
+        Ok(())
+    }
+}
+
+enum HubStatus {
+    Available,
+    Unavailable,
+    Intermittent, // Intermittent connectivity issues
+}
+
+type HubUniquePeers = HashMap<BaseRpcConfig, HubInfoResponse>;
+
+#[derive(Debug)]
+struct Metrics {
+    peers_per_hub: prometheus::Histogram,
+    total_hub_count: prometheus::Gauge,
+    total_messages_histogram: prometheus::Histogram,
+    unavailable_hub_count: prometheus::Gauge,
+}
+
+const CONCURRENCY_LIMIT: usize = 1024;
+static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
+
+impl WatchCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
         // let (registry, metrics) = WatchCommand::initialize_metrics().await?;
         //
@@ -286,32 +279,48 @@ impl WatchCommand {
         //         .header("Content-Type", encoder.format_type())
         //         .body(buffer)
         // });
+        let notify = Arc::new(Notify::new());
+        let watch_server = WatchServer::new(Arc::clone(&notify), MINIMUM_POLL_INTERVAL_MS).await?;
+        tokio::task::spawn(async move {
+           loop {
+               tokio::select! {
+                   _ = signal::ctrl_c() => {
+                       println!("Received Ctrl-C, exiting");
+                       notify.notify_waiters();
+                       break;
+                   } else => {
+                       watch_server.run().await.unwrap();
 
-        let unique_peers: HubUniquePeers = WatchCommand::initialize_peers().await?;
-        info!(
-            "Finished initializing peers for hub: {:?}",
-            unique_peers.len()
-        );
+                   }
+               }
+           }
+        });
 
-        if unique_peers.is_empty() {
-            return Err(eyre!("No peers found"));
-        }
+        // let unique_peers: HubUniquePeers = WatchCommand::initialize_peers().await?;
+        // info!(
+        //     "Finished initializing peers for hub: {:?}",
+        //     unique_peers.len()
+        // );
+        //
+        // if unique_peers.is_empty() {
+        //     return Err(eyre!("No peers found"));
+        // }
 
-        let mut interval = tokio::time::interval(Duration::from_secs(3));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    for (peer, hub_info) in unique_peers.iter() {
-                        println!("Peer: {:?}", peer);
-                        println!("Hub Info: {:?}", hub_info);
-                    }
-                }
-                _ = signal::ctrl_c() => {
-                    println!("Received Ctrl-C, exiting");
-                    break;
-                }
-            }
-        }
+        // let mut interval = tokio::time::interval(Duration::from_secs(3));
+        // loop {
+        //     tokio::select! {
+        //         _ = interval.tick() => {
+        //             for (peer, hub_info) in unique_peers.iter() {
+        //                 println!("Peer: {:?}", peer);
+        //                 println!("Hub Info: {:?}", hub_info);
+        //             }
+        //         }
+        //         _ = signal::ctrl_c() => {
+        //             println!("Received Ctrl-C, exiting");
+        //             break;
+        //         }
+        //     }
+        // }
 
         Ok(())
     }
