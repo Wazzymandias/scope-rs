@@ -62,7 +62,7 @@ pub struct WatchCommand {
 struct WatchServer {
     notify: Arc<Notify>,
     metrics: Arc<Metrics>,
-    metrics_registry: &'static Registry,
+    metrics_registry: Arc<&'static Registry>,
 }
 
 impl WatchServer {
@@ -72,8 +72,45 @@ impl WatchServer {
         Ok(WatchServer {
             notify: Arc::new(Notify::new()),
             metrics: Arc::new(metrics),
-            metrics_registry: registry,
+            metrics_registry: Arc::new(registry),
         })
+    }
+
+    async fn run(&self) -> eyre::Result<()> {
+        loop {
+            tokio::select! {
+                _ = self.notify.notified() => {
+                    break;
+                },
+                _ = signal::ctrl_c() => {
+                    println!("Received Ctrl-C, exiting");
+                    break;
+                }
+            }
+        }
+        let watch_peers_handle = self.watch_peers().await;
+        let metrics_registry = self.metrics_registry.clone();
+        let metrics_route = path!("metrics").and(get()).map(move || {
+            let metric_families = metrics_registry.gather();
+            let mut buffer = Vec::new();
+            let encoder = TextEncoder::new();
+            encoder
+                .encode(&metric_families, &mut buffer)
+                .expect("Failed to encode metrics");
+            Response::builder()
+                .header("Content-Type", encoder.format_type())
+                .body(buffer)
+        });
+
+        let routes = metrics_route.with(warp::log("farcaster::watch"));
+        warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+
+        watch_peers_handle.await?;
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        self.notify.notify_waiters();
     }
 
     async fn initialize_metrics() -> eyre::Result<(&'static Registry, Metrics)> {
