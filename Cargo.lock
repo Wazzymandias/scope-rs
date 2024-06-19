@@ -2200,7 +2200,6 @@ dependencies = [
  "histo",
  "lazy_static",
  "libfuzzer-sys",
- "log",
  "prometheus",
  "prost",
  "rustls-native-certs",
@@ -2214,7 +2213,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
- "url",
  "warp",
 ]
 
