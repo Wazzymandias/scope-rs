@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool};
 use std::sync::{Arc, LazyLock};
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
+use duckdb::ffi::int_fast16_t;
 use prometheus::core::{Atomic, AtomicU64};
 use slog::Drain;
 use tokio::sync::{Notify, RwLock, Semaphore};
@@ -177,7 +178,7 @@ impl HubClientLoader for PeerChannelMap {
                 info!("Channel not found for peer {}", peer_id,);
                 match conf.load_endpoint() {
                     Ok(endpoint) => {
-                        let channel = endpoint.connect_lazy();
+                        let channel = endpoint.connect().await?;
                         map.insert(peer_id.clone(), channel.clone());
                         Ok(HubServiceClient::new(channel))
                     },
@@ -389,12 +390,18 @@ impl WatchServer {
 
             metrics.peers_per_hub.observe(hub_peers.contacts.len() as f64);
 
+            let mut count = 0;
             for peer in hub_peers.contacts {
+                count += 1;
                 let current_peer_set = Arc::clone(&current_peer_set);
                 let peer = peer.clone();
                 let peer_addr = peer.gossip_address.clone().unwrap().address;
                 let peer_endpoints = Arc::clone(&peer_endpoints);
                 set.write().await.insert(peer_addr.clone());
+
+                if count > 10 {
+                    break;
+                }
 
                 peer_handles.push(tokio::task::spawn(async move {
                     {
@@ -403,10 +410,6 @@ impl WatchServer {
                             info!("Semaphore limit reached for unique peers, skipping",);
                             return Ok(());
                         }
-
-                        // if let Err(e) = SEMAPHORE.try_acquire() {
-                        //     return Err(Report::new(e));
-                        // }
 
                         let (conf, info, client) = peer_endpoints.hub_client_from_contact_info(&peer).await?;
 
@@ -421,7 +424,6 @@ impl WatchServer {
                             });
                         }
 
-                        drop(client);
                         Ok(())
                     }
                 }))
@@ -437,6 +439,7 @@ impl WatchServer {
             }
         }
 
+        info!("got past results",);
         {
             let mut uniqp = unique_peers.write().await;
             current_peer_set.write().await.drain().for_each(|(k, v)| {
@@ -553,7 +556,7 @@ impl WatchCommand {
         let notif = Arc::clone(&notify);
         tokio::task::spawn(async move {
             handle_signals(notif).await;
-            sleep(Duration::from_secs(3)).await;
+            sleep(Duration::from_secs(1)).await;
             exit(0);
         });
 
