@@ -23,7 +23,7 @@ use tonic::Request;
 use warp::http::Response;
 use warp::{get, path, Filter};
 
-use crate::cmd::cmd::BaseRpcConfig;
+use crate::cmd::cmd::{BaseRpcConfig, get_tls_config};
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{ContactInfoContentBody, HubInfoRequest, HubInfoResponse};
 use crate::signals::handle_signals;
@@ -106,92 +106,8 @@ struct WatchServer {
 
     poll_interval_duration: Duration,
 
-    peer_endpoints: PeerChannelMap,
     unavailable_peers: Arc<RwLock<UnavailableHubSet>>,
     unique_peers: Arc<RwLock<HubUniquePeers>>,
-}
-
-type PeerChannelMap = Arc<RwLock<HashMap<String,Channel>>>;
-
-trait HubClientLoader {
-    async fn hub_client_from_contact_info(&self, contact_info: &ContactInfoContentBody) -> eyre::Result<(BaseRpcConfig, HubInfoResponse, HubServiceClient<Channel>)>;
-    async fn load_hub_client(&self, peer_id: String, conf: &BaseRpcConfig) -> eyre::Result<HubServiceClient<Channel>>;
-}
-
-impl HubClientLoader for PeerChannelMap {
-    async fn hub_client_from_contact_info(&self, contact_info: &ContactInfoContentBody) -> eyre::Result<(BaseRpcConfig, HubInfoResponse, HubServiceClient<Channel>)> {
-        let conf = BaseRpcConfig::from_contact_info(contact_info).await?;
-        let endpoint = conf.load_endpoint()?;
-
-        let mut client = HubServiceClient::connect(endpoint.clone()).await.map_err(|err| {
-            info!("failed to connect to hub {:?} {:?}: {:?} {:#}", endpoint.uri().clone(), conf.clone(), err.source(), err);
-            Report::new(err)
-        })?;
-
-        // HubServiceClient::get_info(&mut client, HubInfoRequest{db_stats: true}).await.map_err(|err| {
-        //     info!("failed on info request: {:?} {:#}", err.source(), err);
-        //     Report::new(err)
-        // })?.into_inner();
-        // let rpc_address = contact_info.rpc_address.clone().ok_or(eyre!("No rpc address found"))?;
-        // let mut endpoint = format!("http://{}:{}", rpc_address.address, rpc_address.port);
-        // let mut client: HubServiceClient<Channel>;
-
-        // let result = HubServiceClient::connect(endpoint.clone()).await;
-        // if result.is_err() {
-        //     endpoint = format!("https://{}:{}", rpc_address.address, rpc_address.port);
-        //     client = HubServiceClient::connect(endpoint.clone()).await?;
-        // } else {
-        //     client = result?;
-        // }
-
-        let peer_info = client.get_info(HubInfoRequest{db_stats: true}).await.map_err(|err| {
-            info!("failed on info request: {:?} {:#}", err.source(), err);
-            Report::new(err)
-        })?.into_inner();
-
-        // info!("Was able to get peer info",);
-        let peer_id = peer_info.peer_id.clone();
-        let mut map = self.write().await;
-        if let Some(existing_channel) = map.get(&peer_id) {
-            drop(endpoint);
-            drop(client);
-            client = HubServiceClient::new(existing_channel.clone());
-        } else {
-            // let channel = Channel::from_shared(endpoint.clone())?.connect().await?;
-            // map.insert(peer_info.peer_id.clone(), channel);
-            map.insert(peer_info.peer_id.clone(), endpoint.clone().connect().await?);
-        }
-        // map.remove(&peer_id);
-        // map.insert(peer_id.clone(), endpoint.clone().connect_lazy());
-        drop(map);
-
-        Ok((conf, peer_info, client))
-    }
-
-    async fn load_hub_client(&self, peer_id: String, conf: &BaseRpcConfig) -> eyre::Result<HubServiceClient<Channel>> {
-        let mut map = self.write().await;
-        match map.get(&peer_id) {
-            Some(channel) => {
-                Ok(HubServiceClient::new(channel.clone()))
-            }
-            None => {
-                info!("Channel not found for peer {}", peer_id,);
-                match conf.load_endpoint() {
-                    Ok(endpoint) => {
-                        let channel = endpoint.connect().await?;
-                        map.insert(peer_id.clone(), channel.clone());
-                        Ok(HubServiceClient::new(channel))
-                    },
-                    Err(err) => {
-                        Err(err)
-                    }
-                }
-            }
-        }
-        // map.remove(&peer_id);
-        // drop(map);
-        // Ok(HubServiceClient::connect(conf.load_endpoint()?).await?)
-    }
 }
 
 impl WatchServer {
@@ -212,7 +128,6 @@ impl WatchServer {
             metrics_registry: registry,
             poll_interval_duration: Duration::from_millis(poll_interval_ms as u64),
 
-            peer_endpoints: Arc::new(RwLock::new(HashMap::new())),
             unavailable_peers: Arc::new(RwLock::new(UnavailableHubSet::new())),
             unique_peers: Arc::new(RwLock::new(HubUniquePeers::new())),
         })
@@ -363,7 +278,6 @@ impl WatchServer {
         metrics: Arc<Metrics>,
         unique_peers: Arc<RwLock<HubUniquePeers>>,
         unavailable_peers: Arc<RwLock<UnavailableHubSet>>,
-        peer_endpoints: Arc<RwLock<HashMap<String, Channel>>>,
     ) -> eyre::Result<()> {
         let current_peer_set = Arc::new(RwLock::new(HubUniquePeers::new()));
 
@@ -374,12 +288,9 @@ impl WatchServer {
 
         let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
         for (peer_conf, peer_info) in uniq {
-            // info!("Processing peer {}", peer_info.hub_info.peer_id);
+            let endpoint = peer_conf.load_endpoint()?;
+            let mut client = HubServiceClient::connect(endpoint).await?;
 
-            let mut client = peer_endpoints.load_hub_client(peer_info.hub_info.peer_id, &peer_conf).await.map_err(|err| {
-                info!("Yeah it's failing on the new loop {}: {:#}", peer_conf.endpoint.clone(), err);
-                err
-            })?;
             let hub_peers = client
                 .get_current_peers(Request::new(Default::default()))
                 .await
@@ -387,21 +298,15 @@ impl WatchServer {
                     info!("Failed to query hub for peers {}: {:#}", peer_conf.endpoint.clone(), err);
                     Report::new(err)
                 })?.into_inner();
+            drop(client);
 
             metrics.peers_per_hub.observe(hub_peers.contacts.len() as f64);
 
-            let mut count = 0;
             for peer in hub_peers.contacts {
-                count += 1;
                 let current_peer_set = Arc::clone(&current_peer_set);
                 let peer = peer.clone();
                 let peer_addr = peer.gossip_address.clone().unwrap().address;
-                let peer_endpoints = Arc::clone(&peer_endpoints);
                 set.write().await.insert(peer_addr.clone());
-
-                if count > 10 {
-                    break;
-                }
 
                 peer_handles.push(tokio::task::spawn(async move {
                     {
@@ -411,7 +316,12 @@ impl WatchServer {
                             return Ok(());
                         }
 
-                        let (conf, info, client) = peer_endpoints.hub_client_from_contact_info(&peer).await?;
+                        let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
+                        let mut client = HubServiceClient::new(channel);
+                        let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
+                            info!("Failed to query hub info {}: {:#}", conf.endpoint.clone(), err);
+                            Report::new(err)
+                        })?.into_inner();
 
                         {
                             let mut lock = current_peer_set.write().await;
@@ -466,7 +376,6 @@ impl WatchServer {
         for (peer_conf, peer_info) in uniq {
             let metrics = Arc::clone(&self.metrics);
             let peer_conf = peer_conf.clone();
-            let peer_endpoints = Arc::clone(&self.peer_endpoints);
             let uniqp = Arc::clone(&unique_peers);
 
             peer_handles.push(tokio::task::spawn(async move {
@@ -477,7 +386,19 @@ impl WatchServer {
                         return Ok(());
                     }
 
-                    let mut client = peer_endpoints.load_hub_client(peer_info.hub_info.peer_id, &peer_conf).await?;
+                    let endpoint = if peer_conf.https {
+                        format!("https://{}:{}", peer_conf.endpoint, peer_conf.port)
+                    } else {
+                        format!("http://{}:{}", peer_conf.endpoint, peer_conf.port)
+                    };
+                    let channel = if peer_conf.https {
+                        Channel::from_shared(endpoint)?.tls_config(get_tls_config().clone())?.connect().await?
+                    } else {
+                        Channel::from_shared(endpoint)?.connect().await?
+                    };
+
+                    let mut client = HubServiceClient::new(channel);
+                    // let mut client = peer_endpoints.load_hub_client(peer_info.hub_info.peer_id, &peer_conf).await?;
 
                     match client.get_info(HubInfoRequest {db_stats: true}).await {
                         Ok(response) => {
@@ -491,6 +412,8 @@ impl WatchServer {
                             info!("Failed to query hub {:#}: {:#}", peer_conf.endpoint.clone(), err);
                         }
                     }
+                    drop(client);
+
 
                     Ok(())
                 }
@@ -500,9 +423,8 @@ impl WatchServer {
         let met = Arc::clone(&self.metrics);
         let uniqp = Arc::clone(&self.unique_peers);
         let unavp = Arc::clone(&self.unavailable_peers);
-        let endps = Arc::clone(&self.peer_endpoints);
         peer_handles.push(tokio::task::spawn(async move {
-            WatchServer::traverse_peers(met, uniqp, unavp, endps).await
+            WatchServer::traverse_peers(met, uniqp, unavp).await
         }));
 
         info!("Waiting for peer watch to finish",);

@@ -9,7 +9,7 @@ use clap::{Args, CommandFactory, Parser};
 use eyre::eyre;
 use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use crate::cmd::cmd::SubCommands::Parse;
 
 use crate::cmd::diff_cmd::DiffCommand;
@@ -58,9 +58,9 @@ impl BaseRpcConfig {
                 .unwrap()
                 .keep_alive_while_idle(false)
                 .tcp_keepalive(None)
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(3))
                 .http2_adaptive_window(false)
-                .connect_timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(3))
                 .tcp_nodelay(true)
                 .tls_config(get_tls_config().clone())
                 .unwrap())
@@ -69,12 +69,12 @@ impl BaseRpcConfig {
                 .keep_alive_while_idle(false)
                 .tcp_keepalive(None)
                 .http2_adaptive_window(false)
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(3))
                 .tcp_nodelay(true)
-                .connect_timeout(Duration::from_secs(10)))
+                .connect_timeout(Duration::from_secs(3)))
         }
     }
-    pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<Self> {
+    pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<(Self, Channel)> {
         match contact_info.rpc_address.as_ref() {
             None => Err(eyre!("No rpc address found")),
             Some(rpc_info) => {
@@ -103,7 +103,7 @@ impl BaseRpcConfig {
                 };
 
                 match http_error {
-                    Ok(_) => Ok(http_conf),
+                    Ok(result) => Ok((http_conf, result)),
                     Err(http_err) => {
                         let https_result = https_conf.load_endpoint();
                         match https_result {
@@ -111,7 +111,7 @@ impl BaseRpcConfig {
                                 endpoint
                                     .connect()
                                     .await
-                                    .map(|_| https_conf)
+                                    .map(|result| (https_conf, result))
                                     .map_err(|err| eyre!("Failed to connect to https endpoint: {:?}, http endpoint: {:?}", err, http_err))
                             },
                             Err(https_err) => Err(eyre!("Failed to connect to http endpoint: {:?}, https endpoint: {:?}", http_err, https_err)),
@@ -202,7 +202,7 @@ fn initialize_tls_config() -> ClientTlsConfig {
     ClientTlsConfig::new().ca_certificate(cert)
 }
 
-fn get_tls_config() -> &'static ClientTlsConfig {
+pub fn get_tls_config() -> &'static ClientTlsConfig {
     TLS_CONFIG.get_or_init(initialize_tls_config)
 }
 
