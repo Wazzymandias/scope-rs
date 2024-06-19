@@ -349,7 +349,6 @@ impl WatchServer {
             }
         }
 
-        info!("got past results",);
         {
             let mut uniqp = unique_peers.write().await;
             current_peer_set.write().await.drain().for_each(|(k, v)| {
@@ -427,7 +426,6 @@ impl WatchServer {
             WatchServer::traverse_peers(met, uniqp, unavp).await
         }));
 
-        info!("Waiting for peer watch to finish",);
         let result = futures::future::join_all(peer_handles).await;
         for res in result {
             if let Err(e) = res {
