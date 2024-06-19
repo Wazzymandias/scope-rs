@@ -41,7 +41,36 @@ pub(crate) struct BaseRpcConfig {
 
 impl BaseRpcConfig {
     pub fn load_endpoint(&self) -> eyre::Result<Endpoint> {
-        load_endpoint(self)
+        let protocol = if self.https {
+            "https"
+        } else if self.http {
+            "http"
+        } else {
+            return Err(eyre!("Invalid protocol"));
+        };
+        let endpoint: String = format!(
+            "{}://{}:{}",
+            protocol, self.endpoint, self.port
+        );
+
+        if self.https {
+            Ok(Endpoint::from_str(endpoint.as_str())
+                .unwrap()
+                .keep_alive_while_idle(false)
+                .tcp_keepalive(None)
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(10))
+                .tcp_nodelay(true)
+                .tls_config(get_tls_config().clone())
+                .unwrap())
+        } else {
+            Ok(Endpoint::from_str(endpoint.as_str()).unwrap()
+                .keep_alive_while_idle(false)
+                .tcp_keepalive(None)
+                .timeout(Duration::from_secs(10))
+                .tcp_nodelay(true)
+                .connect_timeout(Duration::from_secs(10)))
+        }
     }
     pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<Self> {
         match contact_info.rpc_address.as_ref() {
@@ -60,10 +89,10 @@ impl BaseRpcConfig {
                     endpoint: rpc_info.address.clone(),
                 };
 
-                let http_result = load_endpoint(&http_conf);
+                let http_result = http_conf.load_endpoint();
                 let http_error = match http_result {
                     Ok(endpoint) => {
-                        endpoint.connect_timeout(Duration::from_secs(4))
+                        endpoint
                             .connect()
                             .await
                             .map_err(|err| eyre!("Failed to connect to http endpoint: {:?}", err))
@@ -74,10 +103,10 @@ impl BaseRpcConfig {
                 match http_error {
                     Ok(_) => Ok(http_conf),
                     Err(http_err) => {
-                        let https_result = load_endpoint(&https_conf);
+                        let https_result = https_conf.load_endpoint();
                         match https_result {
                             Ok(endpoint) => {
-                                endpoint.connect_timeout(Duration::from_secs(4))
+                                endpoint
                                     .connect()
                                     .await
                                     .map(|_| https_conf)
@@ -176,29 +205,6 @@ fn get_tls_config() -> &'static ClientTlsConfig {
 }
 
 
-pub(crate) fn load_endpoint(base_config: &BaseRpcConfig) -> eyre::Result<Endpoint> {
-    let protocol = if base_config.https {
-        "https"
-    } else if base_config.http {
-        "http"
-    } else {
-        return Err(eyre!("Invalid protocol"));
-    };
-    let endpoint: String = format!(
-        "{}://{}:{}",
-        protocol, base_config.endpoint, base_config.port
-    );
-
-    if base_config.https {
-        Ok(Endpoint::from_str(endpoint.as_str())
-            .unwrap()
-            .tls_config(get_tls_config().clone())
-            .unwrap())
-    } else {
-        Ok(Endpoint::from_str(endpoint.as_str()).unwrap())
-    }
-}
-
 impl Command {
     pub async fn execute(self) -> eyre::Result<()> {
         match &self.subcommand {
@@ -223,7 +229,7 @@ impl Command {
 
 impl SyncMetadataCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base)?;
+        let tonic_endpoint = self.base.load_endpoint()?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let prefix = parse_prefix(&self.prefix)?;
 
@@ -249,7 +255,7 @@ impl SyncSnapshotCommand {
     pub fn execute(&self) -> eyre::Result<()> {
         let rt = Runtime::new().unwrap();
         let result = rt.block_on(async {
-            let tonic_endpoint = load_endpoint(&self.base)?;
+            let tonic_endpoint = self.base.load_endpoint()?;
             let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
             let prefix = parse_prefix(&self.prefix)?;
 

@@ -1,7 +1,7 @@
 use clap::Args;
 use eyre::eyre;
 
-use crate::cmd::cmd::{BaseRpcConfig, load_endpoint};
+use crate::cmd::cmd::{BaseRpcConfig};
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::SyncIds;
 
@@ -16,7 +16,7 @@ pub struct MessagesCommand {
 
 impl MessagesCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base)?;
+        let tonic_endpoint = self.base.load_endpoint()?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let prefix = crate::cmd::cmd::parse_prefix(&self.sync_id)?;
         let response = client

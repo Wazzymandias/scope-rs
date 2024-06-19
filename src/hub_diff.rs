@@ -1,10 +1,8 @@
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{VecDeque};
 use std::fs::File;
 use std::hash::Hash;
 use std::io::BufWriter;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,10 +25,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tonic::transport::{Channel, Endpoint};
 use crate::farcaster::DEFAULT_CACHE_DB_DIR;
-use crate::farcaster::sync_id::SyncIdType::{FName, Message, OnChainEvent, Unknown};
 
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{HubEventType, SyncIds, TrieNodeMetadataResponse, TrieNodePrefix};
+use crate::proto::{SyncIds, TrieNodePrefix};
 
 const PREFIX_SET_KEY: &[u8] = b"prefix_set";
 const DUCKDB_PATH: &str = ".duckdb";

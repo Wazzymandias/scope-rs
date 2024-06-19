@@ -94,19 +94,19 @@ pub struct DiffCommand {
 impl DiffCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
         let source_endpoint =
-            crate::cmd::cmd::load_endpoint(&BaseRpcConfig {
+            (&BaseRpcConfig {
                 http: self.source.source_http,
                 https: self.source.source_https,
                 port: self.source.source_port,
                 endpoint: self.source.source_endpoint.clone(),
-            })?;
+            }).load_endpoint()?;
         let target_endpoint =
-            crate::cmd::cmd::load_endpoint(&BaseRpcConfig {
+            (&BaseRpcConfig {
                 http: self.target.target_http,
                 https: self.target.target_https,
                 port: self.target.target_port,
                 endpoint: self.target.target_endpoint.clone(),
-            })?;
+            }).load_endpoint()?;
 
         let (start_time, end_time) = self.time_args.parse_start_and_end_time()?;
         info!("Performing diff between {:?} and {:?}", start_time, end_time);

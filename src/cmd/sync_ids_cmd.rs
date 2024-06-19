@@ -14,7 +14,7 @@ pub(crate) struct SyncIdsCommand {
 impl SyncIdsCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
         let prefix = crate::cmd::cmd::parse_prefix(&Some(self.prefix.clone()))?;
-        let endpoint = crate::cmd::cmd::load_endpoint(&self.base)?;
+        let endpoint = self.base.load_endpoint()?;
         let mut client =
             crate::proto::hub_service_client::HubServiceClient::connect(endpoint).await?;
         let response = client

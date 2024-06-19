@@ -1,4 +1,4 @@
-use crate::cmd::cmd::{load_endpoint, BaseRpcConfig};
+use crate::cmd::cmd::{BaseRpcConfig};
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::Empty;
 use clap::Args;
@@ -12,7 +12,7 @@ pub struct PeersCommand {
 
 impl PeersCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = load_endpoint(&self.base)?;
+        let tonic_endpoint = self.base.load_endpoint()?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
         let request = tonic::Request::new(Empty {});
         let response = client.get_current_peers(request).await.unwrap();
