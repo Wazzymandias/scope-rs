@@ -209,19 +209,24 @@ impl WatchServer {
             linear_buckets(510_000.0, 5_000.0, 10)?,
         ))?;
 
-        let total_hub_count = prometheus::Gauge::with_opts(opts!(
-            "total_hub_count",
-            "Total number of hubs that are currently available"
-        ))?;
-
         let total_messages_histogram = prometheus::Histogram::with_opts(histogram_opts!(
             "total_messages_histogram",
             "Total message count histogram across hubs",
             linear_buckets(420_000_000.0, 5_000_000.0, 10)?,
         ))?;
 
+        let total_hub_count = prometheus::Gauge::with_opts(opts!(
+            "total_hub_count",
+            "Total number of hubs that are currently available"
+        ))?;
+
+        let available_hub_count = prometheus::Gauge::with_opts(opts!(
+            "total_hub_count_available",
+            "Total number of hubs that are currently available"
+        ))?;
+
         let unavailable_hub_count = prometheus::Gauge::with_opts(opts!(
-            "unavailable_hub_count",
+            "total_hub_count_unavailable",
             "Total number of hubs that are currently unavailable"
         ))?;
 
@@ -232,6 +237,7 @@ impl WatchServer {
         registry.register(Box::new(total_fname_events_histogram.clone()))?;
         registry.register(Box::new(total_hub_count.clone()))?;
         registry.register(Box::new(total_messages_histogram.clone()))?;
+        registry.register(Box::new(available_hub_count.clone()))?;
         registry.register(Box::new(unavailable_hub_count.clone()))?;
 
         Ok((
@@ -242,6 +248,7 @@ impl WatchServer {
                 total_fname_events_histogram,
                 total_hub_count,
                 total_messages_histogram,
+                available_hub_count,
                 unavailable_hub_count,
             },
         ))
@@ -315,34 +322,30 @@ impl WatchServer {
                 let contacts = Arc::clone(&contacts_set);
 
                 peer_handles.push(tokio::task::spawn(async move {
-                    {
-                        let permit = match SEMAPHORE.acquire().await {
-                            Ok(permit) => permit,
-                            Err(err) => {
-                                info!("Failed to acquire semaphore permit: {:#}", err);
-                                return Err(Report::new(err));
+                    match SEMAPHORE.acquire().await {
+                        Ok(_permit) => {
+                            let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
+                            let mut client = HubServiceClient::new(channel);
+                            let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
+                                Report::new(err)
+                            })?.into_inner();
+
+                            {
+                                let mut lock = current_peer_set.write().await;
+                                lock.entry(conf).or_insert(HubInfo {
+                                    status: HubStatus::Available,
+                                    hub_info: info,
+                                });
+                                contacts.write().await.insert(peer, HubStatus::Available);
                             }
-                        };
-
-                        let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
-                        let mut client = HubServiceClient::new(channel);
-                        let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
-                            // info!("Failed to query hub info {}: {:#}", conf.endpoint.clone(), err);
-                            Report::new(err)
-                        })?.into_inner();
-
-                        {
-                            let mut lock = current_peer_set.write().await;
-                            lock.entry(conf).or_insert(HubInfo {
-                                status: HubStatus::Available,
-                                hub_info: info,
-                            });
-                            contacts.write().await.insert(peer, HubStatus::Available);
+                            drop(client)
                         }
-
-                        drop(permit);
-                        Ok(())
+                        Err(err) => {
+                            return Err(Report::new(err));
+                        }
                     }
+
+                    Ok(())
                 }))
             }
         }
@@ -365,13 +368,13 @@ impl WatchServer {
 
         {
             let contacts = contacts_set.read().await;
-
             let available = contacts.iter().filter(|(_, status)| **status == HubStatus::Available).count();
             let unavailable = contacts.iter().filter(|(_, status)| **status == HubStatus::Unavailable).count();
             let unknown = contacts.iter().filter(|(_, status)| **status == HubStatus::Unknown).count();
             let total_hub_count = contacts.len();
             info!("contacts: {} {} {} {}", total_hub_count, available, unavailable, unknown);
             metrics.total_hub_count.set(total_hub_count as f64);
+            metrics.available_hub_count.set(available as f64);
             metrics.unavailable_hub_count.set((unavailable + unknown) as f64);
         }
 
@@ -392,36 +395,32 @@ impl WatchServer {
             let uniqp = Arc::clone(&unique_peers);
 
             peer_handles.push(tokio::task::spawn(async move {
-                {
-                    let permit = match SEMAPHORE.acquire().await {
-                        Ok(permit) => permit,
-                        Err(err) => {
-                            info!("Failed to acquire semaphore permit: {:#}", err);
-                            return Err(Report::new(err));
-                        }
-                    };
+                match SEMAPHORE.acquire().await {
+                    Ok(_permit) => {
+                        let endpoint = peer_conf.load_endpoint()?;
+                        let mut client = HubServiceClient::connect(endpoint).await?;
 
-                    let endpoint = peer_conf.load_endpoint()?;
-                    let mut client = HubServiceClient::connect(endpoint).await?;
-
-                    match client.get_info(HubInfoRequest {db_stats: true}).await {
-                        Ok(response) => {
-                            if let Some(db_stats) = response.into_inner().db_stats {
-                                metrics.total_fid_events_histogram.observe(db_stats.num_fid_events as f64);
-                                metrics.total_fname_events_histogram.observe(db_stats.num_fname_events as f64);
-                                metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
+                        match client.get_info(HubInfoRequest {db_stats: true}).await {
+                            Ok(response) => {
+                                if let Some(db_stats) = response.into_inner().db_stats {
+                                    metrics.total_fid_events_histogram.observe(db_stats.num_fid_events as f64);
+                                    metrics.total_fname_events_histogram.observe(db_stats.num_fname_events as f64);
+                                    metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
+                                }
+                            }
+                            Err(err) => {
+                                // info!("Failed to query hub {:#}: {:#}", peer_conf.endpoint.clone(), err);
+                                return Err(Report::new(err));
                             }
                         }
-                        Err(err) => {
-                            // info!("Failed to query hub {:#}: {:#}", peer_conf.endpoint.clone(), err);
-                            return Err(Report::new(err));
-                        }
+                        drop(client);
                     }
-                    drop(client);
-                    drop(permit);
-
-                    Ok(())
+                    Err(err) => {
+                        return Err(Report::new(err));
+                    }
                 }
+
+                Ok(())
             }))
         }
 
@@ -470,6 +469,7 @@ struct Metrics {
     total_hub_count: prometheus::Gauge,
     total_messages_histogram: prometheus::Histogram,
     unavailable_hub_count: prometheus::Gauge,
+    available_hub_count: prometheus::Gauge,
 }
 
 const CONCURRENCY_LIMIT: usize = 1024;
