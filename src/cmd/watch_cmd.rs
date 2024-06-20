@@ -327,12 +327,6 @@ impl WatchServer {
                                 Report::new(err)
                             })?.into_inner();
 
-                            // let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
-                            // let mut client = HubServiceClient::new(channel);
-                            // let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
-                            //     Report::new(err)
-                            // })?.into_inner();
-
                             {
                                 let mut lock = current_peer_set.write().await;
                                 lock.entry(conf).or_insert(HubInfo {

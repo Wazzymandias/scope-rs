@@ -20,6 +20,7 @@ mod farcaster;
 mod hub_diff;
 mod deque;
 mod signals;
+mod waitgroup;
 
 fn create_logger() -> Logger {
     let drain = Json::new(std::io::stdout())

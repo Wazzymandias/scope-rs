@@ -1,13 +1,13 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::Args;
 use eyre::eyre;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 use crate::cmd::cmd::BaseRpcConfig;
 use crate::proto::Empty;
 use crate::proto::hub_service_client::HubServiceClient;
+use crate::waitgroup::WaitGroup;
 
 #[derive(Args, Debug)]
 pub struct PeersCommand {
@@ -16,37 +16,6 @@ pub struct PeersCommand {
 
     #[arg(long, default_value = "false")]
     validate_rpc: bool,
-}
-
-
-struct WaitGroup {
-    counter: Arc<AtomicUsize>,
-    notify: Arc<Notify>,
-}
-
-impl WaitGroup {
-    fn new() -> Self {
-        WaitGroup {
-            counter: Arc::new(AtomicUsize::new(0)),
-            notify: Arc::new(Notify::new()),
-        }
-    }
-
-    fn add(&self) {
-        self.counter.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn done(&self) {
-        if self.counter.fetch_sub(1, Ordering::SeqCst) > 0 {
-            self.notify.notify_last();
-        }
-    }
-
-    async fn wait(&self) {
-        while self.counter.load(Ordering::SeqCst) != 0 {
-            self.notify.notified().await;
-        }
-    }
 }
 
 
