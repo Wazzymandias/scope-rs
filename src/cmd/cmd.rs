@@ -180,11 +180,11 @@ pub struct SyncSnapshotCommand {
 pub(crate) fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::ParseIntError> {
     match input {
         None => {
-            return Ok(vec![]);
+            Ok(vec![])
         }
         Some(input) => {
             if input.is_empty() {
-                return Ok(vec![]);
+                Ok(vec![])
             } else {
                 input.split(',').map(|s| s.trim().parse()).collect()
             }
@@ -199,7 +199,7 @@ fn initialize_tls_config() -> ClientTlsConfig {
     let mut combined_pem = Vec::new();
     for cert in native_certs {
         writeln!(&mut combined_pem, "-----BEGIN CERTIFICATE-----").unwrap();
-        writeln!(&mut combined_pem, "{}", STANDARD.encode(&cert.to_vec())).unwrap();
+        writeln!(&mut combined_pem, "{}", STANDARD.encode(&cert)).unwrap();
         writeln!(&mut combined_pem, "-----END CERTIFICATE-----").unwrap();
     }
 
@@ -261,7 +261,9 @@ impl SyncMetadataCommand {
 impl SyncSnapshotCommand {
     pub fn execute(&self) -> eyre::Result<()> {
         let rt = Runtime::new().unwrap();
-        let result = rt.block_on(async {
+        
+
+        rt.block_on(async {
             let tonic_endpoint = self.base.load_endpoint()?;
             let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
             let prefix = parse_prefix(&self.prefix)?;
@@ -277,9 +279,7 @@ impl SyncSnapshotCommand {
             }
             println!("{}", str_response.unwrap());
             Ok(())
-        });
-
-        result
+        })
     }
 }
 

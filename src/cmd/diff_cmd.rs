@@ -19,7 +19,7 @@ impl TimeArgs {
     pub fn parse_start_and_end_time(&self) -> eyre::Result<(DateTime<Utc>, DateTime<Utc>)> {
         let end_date = match &self.to_day {
             Some(day) => {
-                let date_time = NaiveDate::parse_from_str(&day, "%Y-%m-%d")?;
+                let date_time = NaiveDate::parse_from_str(day, "%Y-%m-%d")?;
                 Utc.from_utc_datetime(&date_time.and_hms_opt(0, 0, 0).ok_or(eyre!("Invalid date"))?)
             },
             None => {
@@ -28,7 +28,7 @@ impl TimeArgs {
         };
         let start_date = match &self.from_day {
             Some(day) => {
-                let date_time = NaiveDate::parse_from_str(&day, "%Y-%m-%d")?;
+                let date_time = NaiveDate::parse_from_str(day, "%Y-%m-%d")?;
                 Utc.from_utc_datetime(&date_time.and_hms_opt(0, 0, 0).ok_or(eyre!("Invalid date"))?)
             },
             None => {
@@ -94,19 +94,19 @@ pub struct DiffCommand {
 impl DiffCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
         let source_endpoint =
-            (&BaseRpcConfig {
+            BaseRpcConfig {
                 http: self.source.source_http,
                 https: self.source.source_https,
                 port: self.source.source_port,
                 endpoint: self.source.source_endpoint.clone(),
-            }).load_endpoint()?;
+            }.load_endpoint()?;
         let target_endpoint =
-            (&BaseRpcConfig {
+            BaseRpcConfig {
                 http: self.target.target_http,
                 https: self.target.target_https,
                 port: self.target.target_port,
                 endpoint: self.target.target_endpoint.clone(),
-            }).load_endpoint()?;
+            }.load_endpoint()?;
 
         let (start_time, end_time) = self.time_args.parse_start_and_end_time()?;
         info!("Performing diff between {:?} and {:?}", start_time, end_time);
@@ -114,8 +114,7 @@ impl DiffCommand {
         let state_differ = HubStateDiffer::new(source_endpoint, target_endpoint);
         let sync_id_diff_report = state_differ?
             .diff_sync_ids(start_time, end_time)
-            .await
-            .or_else(|e| Err(eyre!("{:?}", e)))?;
+            .await.map_err(|e| eyre!("{:?}", e))?;
 
         println!("-----------------------Only in Source-----------------------------");
         println!("{}", SyncIdDiffReport::histogram_by_root_prefix(&sync_id_diff_report.only_in_a)?);

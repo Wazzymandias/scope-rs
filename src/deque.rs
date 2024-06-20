@@ -107,7 +107,7 @@ impl<T> Deque<T> {
 // Destructor to clean up any remaining elements
 impl<T> Drop for Deque<T> {
     fn drop(&mut self) {
-        while let Some(_) = self.pop_back() {}
+        while self.pop_back().is_some() {}
     }
 }
 

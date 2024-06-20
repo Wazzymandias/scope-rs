@@ -60,9 +60,9 @@ COMMIT;
 
     pub fn stop(self) -> eyre::Result<()> {
         self.persistent_cache_db.flush()?;
-        self.db_conn.close().or_else(|e| {
+        self.db_conn.close().map_err(|e| {
             error!("Error closing duckdb connection: {:?}", e);
-            Err(eyre::eyre!("Error closing duckdb connection"))
+            eyre::eyre!("Error closing duckdb connection")
         })?;
         Ok(())
     }
@@ -103,7 +103,7 @@ COMMIT;
             ON a.id = sub.sync_id
             ";
 
-        let mut result = self.db_conn.prepare(&difference)?;
+        let mut result = self.db_conn.prepare(difference)?;
         let mut rows = result.query(params![a_source, b_source]).map_err(|e| eyre::eyre!("Error querying difference: {:?}", e))?;
         let mut sync_ids: SyncIds = SyncIds{
             sync_ids: Vec::new(),

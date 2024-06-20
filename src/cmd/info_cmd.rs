@@ -14,7 +14,7 @@ impl InfoCommand {
         let base = self.base.clone();
 
         let tonic_endpoint =
-           base.load_endpoint().or_else(|e| Err(eyre!("{:?}", e)))?;
+           base.load_endpoint().map_err(|e| eyre!("{:?}", e))?;
         let mut client = HubServiceClient::connect(tonic_endpoint).await?;
         let request = tonic::Request::new(HubInfoRequest { db_stats: true });
         let response = client.get_info(request).await?;

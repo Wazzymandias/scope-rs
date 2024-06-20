@@ -7,7 +7,6 @@ use clap::Parser;
 use slog::{Drain, Logger, o, PushFnValue, Record};
 use slog_async::Async;
 use slog_json::Json;
-use slog_scope;
 
 use crate::cmd::cmd::Command;
 

@@ -73,7 +73,7 @@ impl SyncIdCommand {
         println!("{:?}", farcaster_to_unix(ts_value as u64));
         // let x = c.unwrap();
         // let y = x.to_utc().to_string();
-        println!("{}", d.to_string());
+        println!("{}", d);
         let fid = u32::from_be_bytes(
             bytes[TIMESTAMP_LENGTH + 1..TIMESTAMP_LENGTH + 1 + FID_BYTES]
                 .try_into()

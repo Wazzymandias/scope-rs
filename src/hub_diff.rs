@@ -54,7 +54,7 @@ fn spawn_tree_thread(
     mut conn: Connection,
     mut channel: Receiver<DbOperation>,
 ) -> std::thread::JoinHandle<eyre::Result<()>> {
-    return std::thread::spawn(move || {
+    std::thread::spawn(move || {
         while let Some(operation) = channel.blocking_recv() {
             match operation {
                 DbOperation::BatchSyncIds {
@@ -63,7 +63,7 @@ fn spawn_tree_thread(
                     cache_tree,
                     cache_entries,
                 } => {
-                    let tx_result = (&mut conn).transaction();
+                    let tx_result = conn.transaction();
                     let tx: Transaction;
                     match tx_result {
                         Ok(t) => {
@@ -129,10 +129,7 @@ fn spawn_tree_thread(
                     // 1. Insert the sync ids
                     let mut statement = tx.prepare(&insert_sync_ids_query).unwrap();
                     let rows = statement.query(
-                        to_sql_params
-                            .iter()
-                            .map(|&p| p)
-                            .collect::<Vec<_>>()
+                        to_sql_params.to_vec()
                             .as_slice(),
                     );
                     if rows.is_err() {
@@ -227,7 +224,7 @@ fn spawn_tree_thread(
         }
         conn.close().unwrap();
         Ok(())
-    });
+    })
 }
 
 #[derive(Debug)]
@@ -272,7 +269,7 @@ impl ParseSyncId for SyncId {
 impl SyncIdDiffReport {
     pub fn histogram_by_root_prefix(ids: &SyncIds) -> eyre::Result<Histogram> {
         let mut histogram = Histogram::with_buckets(32);
-        let id_types = ids.sync_ids.iter().map(|sync_id| SyncId::root_prefix_from(sync_id));
+        let id_types = ids.sync_ids.iter().map(SyncId::root_prefix_from);
         id_types.for_each(|id_type| {
             histogram.add(id_type as u64)
         });
@@ -282,7 +279,7 @@ impl SyncIdDiffReport {
 
     pub fn histogram_by_timestamp(ids: &SyncIds) -> eyre::Result<Histogram> {
         let mut histogram = Histogram::with_buckets(64);
-        let timestamps = ids.sync_ids.iter().map(|sync_id| SyncId::timestamp_from(sync_id));
+        let timestamps = ids.sync_ids.iter().map(SyncId::timestamp_from);
         timestamps.for_each(|timestamp| {
             histogram.add(timestamp.unwrap())
         });
@@ -514,7 +511,7 @@ impl HubStateDiffer {
             }
         }
 
-        return Ok(num_processed);
+        Ok(num_processed)
     }
 
     // diff exhaustive will do a full scan of two hub tries
@@ -560,11 +557,11 @@ impl HubStateDiffer {
             .join()
             .map_err(|e| eyre!("error joining db thread: {:?}", e))?;
 
-        let only_in_a = (&self.repo).sync_id_set_difference(
+        let only_in_a = self.repo.sync_id_set_difference(
             self.endpoint_a.clone().uri().to_string(),
             self.endpoint_b.clone().uri().to_string(),
         )?;
-        let only_in_b = (&self.repo).sync_id_set_difference(
+        let only_in_b = self.repo.sync_id_set_difference(
             self.endpoint_b.clone().uri().to_string(),
             self.endpoint_a.clone().uri().to_string(),
         )?;
