@@ -1,10 +1,8 @@
-use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::Args;
 use eyre::eyre;
-use slog_scope::info;
 use tokio::sync::{Notify, RwLock};
 
 use crate::cmd::cmd::BaseRpcConfig;
@@ -59,7 +57,7 @@ impl PeersCommand {
         let request = tonic::Request::new(Empty {});
         let response = client.get_current_peers(request).await.unwrap();
 
-        let mut valid = Arc::new(RwLock::new(vec![]));
+        let valid = Arc::new(RwLock::new(vec![]));
         let response = if self.validate_rpc {
             let wg = Arc::new(WaitGroup::new());
             for peer in response.into_inner().contacts {

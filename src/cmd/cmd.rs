@@ -9,7 +9,7 @@ use clap::{Args, CommandFactory, Parser};
 use eyre::eyre;
 use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
 use crate::cmd::diff_cmd::DiffCommand;
 use crate::cmd::info_cmd::InfoCommand;
