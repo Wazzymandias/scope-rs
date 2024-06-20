@@ -284,10 +284,11 @@ impl WatchServer {
         let uniq: Vec<(BaseRpcConfig, HubInfo)> = unique_peers.read().await.iter().map(|(k, v)| {
             (k.clone(), v.clone())
         }).collect();
-        let mut set: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let contacts_set: Arc<RwLock<HashMap<ContactInfoContentBody, HubStatus>>>= Arc::new(RwLock::new(HashMap::new()));
 
         let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
         for (peer_conf, peer_info) in uniq {
+            let peer_id = peer_info.hub_info.peer_id.clone();
             let endpoint = peer_conf.load_endpoint()?;
             let mut client = HubServiceClient::connect(endpoint).await?;
 
@@ -303,37 +304,43 @@ impl WatchServer {
             metrics.peers_per_hub.observe(hub_peers.contacts.len() as f64);
 
             for peer in hub_peers.contacts {
+                if contacts_set.read().await.get(&peer).is_some_and(|status| *status == HubStatus::Available || *status == HubStatus::Unavailable) {
+                    continue;
+                }
+                contacts_set.write().await.insert(peer.clone(), HubStatus::Unknown);
+
                 let current_peer_set = Arc::clone(&current_peer_set);
                 let peer = peer.clone();
                 let peer_addr = peer.gossip_address.clone().unwrap().address;
-                set.write().await.insert(peer_addr.clone());
+                let contacts = Arc::clone(&contacts_set);
 
                 peer_handles.push(tokio::task::spawn(async move {
                     {
-                        let permit = SEMAPHORE.acquire().await;
-                        if permit.is_err() {
-                            info!("Semaphore limit reached for unique peers, skipping",);
-                            return Ok(());
-                        }
+                        let permit = match SEMAPHORE.acquire().await {
+                            Ok(permit) => permit,
+                            Err(err) => {
+                                info!("Failed to acquire semaphore permit: {:#}", err);
+                                return Err(Report::new(err));
+                            }
+                        };
 
                         let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
                         let mut client = HubServiceClient::new(channel);
                         let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
-                            info!("Failed to query hub info {}: {:#}", conf.endpoint.clone(), err);
+                            // info!("Failed to query hub info {}: {:#}", conf.endpoint.clone(), err);
                             Report::new(err)
                         })?.into_inner();
 
                         {
                             let mut lock = current_peer_set.write().await;
-                            if lock.contains_key(&conf) {
-                                return Ok(());
-                            }
-                            lock.insert(conf.clone(), HubInfo {
+                            lock.entry(conf).or_insert(HubInfo {
                                 status: HubStatus::Available,
                                 hub_info: info,
                             });
+                            contacts.write().await.insert(peer, HubStatus::Available);
                         }
 
+                        drop(permit);
                         Ok(())
                     }
                 }))
@@ -356,10 +363,17 @@ impl WatchServer {
             });
         }
 
-        let total_hub_count = set.read().await.len();
-        let total_unavailable_hub_count = total_hub_count - unique_peers.read().await.len();
-        metrics.total_hub_count.set(total_hub_count as f64);
-        metrics.unavailable_hub_count.set(total_unavailable_hub_count as f64);
+        {
+            let contacts = contacts_set.read().await;
+
+            let available = contacts.iter().filter(|(_, status)| **status == HubStatus::Available).count();
+            let unavailable = contacts.iter().filter(|(_, status)| **status == HubStatus::Unavailable).count();
+            let unknown = contacts.iter().filter(|(_, status)| **status == HubStatus::Unknown).count();
+            let total_hub_count = contacts.len();
+            info!("contacts: {} {} {} {}", total_hub_count, available, unavailable, unknown);
+            metrics.total_hub_count.set(total_hub_count as f64);
+            metrics.unavailable_hub_count.set((unavailable + unknown) as f64);
+        }
 
         Ok(())
     }
@@ -379,25 +393,16 @@ impl WatchServer {
 
             peer_handles.push(tokio::task::spawn(async move {
                 {
-                    let permit = SEMAPHORE.acquire().await;
-                    if permit.is_err() {
-                        info!("Semaphore limit reached for unique peers, skipping",);
-                        return Ok(());
-                    }
-
-                    let endpoint = if peer_conf.https {
-                        format!("https://{}:{}", peer_conf.endpoint, peer_conf.port)
-                    } else {
-                        format!("http://{}:{}", peer_conf.endpoint, peer_conf.port)
-                    };
-                    let channel = if peer_conf.https {
-                        Channel::from_shared(endpoint)?.tls_config(get_tls_config().clone())?.connect().await?
-                    } else {
-                        Channel::from_shared(endpoint)?.connect().await?
+                    let permit = match SEMAPHORE.acquire().await {
+                        Ok(permit) => permit,
+                        Err(err) => {
+                            info!("Failed to acquire semaphore permit: {:#}", err);
+                            return Err(Report::new(err));
+                        }
                     };
 
-                    let mut client = HubServiceClient::new(channel);
-                    // let mut client = peer_endpoints.load_hub_client(peer_info.hub_info.peer_id, &peer_conf).await?;
+                    let endpoint = peer_conf.load_endpoint()?;
+                    let mut client = HubServiceClient::connect(endpoint).await?;
 
                     match client.get_info(HubInfoRequest {db_stats: true}).await {
                         Ok(response) => {
@@ -408,11 +413,12 @@ impl WatchServer {
                             }
                         }
                         Err(err) => {
-                            info!("Failed to query hub {:#}: {:#}", peer_conf.endpoint.clone(), err);
+                            // info!("Failed to query hub {:#}: {:#}", peer_conf.endpoint.clone(), err);
+                            return Err(Report::new(err));
                         }
                     }
                     drop(client);
-
+                    drop(permit);
 
                     Ok(())
                 }
@@ -434,6 +440,7 @@ impl WatchServer {
                 info!("Error found for peer handler: {:?}", e);
             }
         }
+        info!("{}", SEMAPHORE.available_permits());
 
         Ok(())
     }
@@ -465,7 +472,7 @@ struct Metrics {
     unavailable_hub_count: prometheus::Gauge,
 }
 
-const CONCURRENCY_LIMIT: usize = 256;
+const CONCURRENCY_LIMIT: usize = 1024;
 static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
 
 impl WatchCommand {

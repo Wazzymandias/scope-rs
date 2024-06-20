@@ -39,6 +39,7 @@ pub(crate) struct BaseRpcConfig {
     pub(crate) endpoint: String,
 }
 
+
 impl BaseRpcConfig {
     pub fn load_endpoint(&self) -> eyre::Result<Endpoint> {
         let protocol = if self.https {
@@ -61,16 +62,19 @@ impl BaseRpcConfig {
                 .timeout(Duration::from_secs(3))
                 .http2_adaptive_window(false)
                 .connect_timeout(Duration::from_secs(3))
-                .tcp_nodelay(true)
-                .tls_config(get_tls_config().clone())
-                .unwrap())
+                .concurrency_limit(1024)
+                .tcp_nodelay(false)
+                // .tls_config(get_tls_config().clone())
+                // .unwrap())
+            )
         } else {
             Ok(Endpoint::from_str(endpoint.as_str()).unwrap()
                 .keep_alive_while_idle(false)
                 .tcp_keepalive(None)
                 .http2_adaptive_window(false)
                 .timeout(Duration::from_secs(3))
-                .tcp_nodelay(true)
+                .concurrency_limit(1024)
+                .tcp_nodelay(false)
                 .connect_timeout(Duration::from_secs(3)))
         }
     }

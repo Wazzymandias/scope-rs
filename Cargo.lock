@@ -2764,6 +2764,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
  "tokio",
