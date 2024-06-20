@@ -4,22 +4,20 @@ use std::fs::File;
 use std::hash::Hash;
 use std::io::BufWriter;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::deque::Deque;
 use crate::farcaster;
 use crate::farcaster::sync_id::{
-    RootPrefix, SyncId, SyncIdType, UnpackedSyncId, FID_BYTES, TIMESTAMP_LENGTH,
+    RootPrefix, SyncId, SyncIdType, TIMESTAMP_LENGTH,
 };
 use crate::farcaster::time::{
-    farcaster_time_range, farcaster_time_to_str, farcaster_to_unix, str_bytes_to_unix_time,
+    farcaster_time_to_str, farcaster_to_unix,
     FARCASTER_EPOCH,
 };
-use duckdb::{params, Connection, ToSql, Transaction};
+use duckdb::{Connection, ToSql, Transaction};
 use eyre::eyre;
 use histo::Histogram;
 use farcaster::CachedRepository;
-use sled::{IVec, Tree};
+use sled::Tree;
 use slog_scope::{debug, info};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;

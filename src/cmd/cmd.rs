@@ -10,7 +10,6 @@ use eyre::eyre;
 use rustls_native_certs::load_native_certs;
 use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
-use crate::cmd::cmd::SubCommands::Parse;
 
 use crate::cmd::diff_cmd::DiffCommand;
 use crate::cmd::info_cmd::InfoCommand;
@@ -78,7 +77,7 @@ impl BaseRpcConfig {
                 .connect_timeout(Duration::from_secs(3)))
         }
     }
-    pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<(Self, Channel)> {
+    pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<(Self, Endpoint)> {
         match contact_info.rpc_address.as_ref() {
             None => Err(eyre!("No rpc address found")),
             Some(rpc_info) => {
@@ -98,25 +97,27 @@ impl BaseRpcConfig {
                 let http_result = http_conf.load_endpoint();
                 let http_error = match http_result {
                     Ok(endpoint) => {
-                        endpoint
-                            .connect()
-                            .await
-                            .map_err(|err| eyre!("Failed to connect to http endpoint: {:?}", err))
+                        Ok((http_conf, endpoint))
+                        // endpoint
+                        //     .connect()
+                        //     .await
+                        //     .map_err(|err| eyre!("Failed to connect to http endpoint: {:?}", err))
                     }
                     Err(e) => Err(e),
                 };
 
                 match http_error {
-                    Ok(result) => Ok((http_conf, result)),
+                    Ok(result) => Ok(result),
                     Err(http_err) => {
                         let https_result = https_conf.load_endpoint();
                         match https_result {
                             Ok(endpoint) => {
-                                endpoint
-                                    .connect()
-                                    .await
-                                    .map(|result| (https_conf, result))
-                                    .map_err(|err| eyre!("Failed to connect to https endpoint: {:?}, http endpoint: {:?}", err, http_err))
+                                Ok((https_conf, endpoint))
+                                // endpoint
+                                    // .connect()
+                                    // .await
+                                    // .map(|result| (https_conf, result))
+                                    // .map_err(|err| eyre!("Failed to connect to https endpoint: {:?}, http endpoint: {:?}", err, http_err))
                             },
                             Err(https_err) => Err(eyre!("Failed to connect to http endpoint: {:?}, https endpoint: {:?}", http_err, https_err)),
                         }

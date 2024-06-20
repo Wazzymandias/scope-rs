@@ -4,26 +4,23 @@ use futures::stream::FuturesUnordered;
 use prometheus::{histogram_opts, opts, Encoder, Registry, TextEncoder, linear_buckets, exponential_buckets};
 use slog_scope::info;
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::process::exit;
 use std::string::ToString;
 use std::sync::atomic::{AtomicBool};
 use std::sync::{Arc, LazyLock};
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
-use duckdb::ffi::int_fast16_t;
-use prometheus::core::{Atomic, AtomicU64};
+use prometheus::core::Atomic;
 use slog::Drain;
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep};
-use tonic::transport::{Channel};
 use tonic::Request;
 use warp::http::Response;
 use warp::{get, path, Filter};
 
-use crate::cmd::cmd::{BaseRpcConfig, get_tls_config};
+use crate::cmd::cmd::BaseRpcConfig;
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{ContactInfoContentBody, HubInfoRequest, HubInfoResponse};
 use crate::signals::handle_signals;
@@ -324,11 +321,17 @@ impl WatchServer {
                 peer_handles.push(tokio::task::spawn(async move {
                     match SEMAPHORE.acquire().await {
                         Ok(_permit) => {
-                            let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
-                            let mut client = HubServiceClient::new(channel);
+                            let (conf, endp) = BaseRpcConfig::from_contact_info(&peer).await?;
+                            let mut client = HubServiceClient::connect(endp).await?;
                             let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
                                 Report::new(err)
                             })?.into_inner();
+
+                            // let (conf, channel) = BaseRpcConfig::from_contact_info(&peer).await?;
+                            // let mut client = HubServiceClient::new(channel);
+                            // let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
+                            //     Report::new(err)
+                            // })?.into_inner();
 
                             {
                                 let mut lock = current_peer_set.write().await;
