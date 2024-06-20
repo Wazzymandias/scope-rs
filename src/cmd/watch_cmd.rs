@@ -22,7 +22,7 @@ use warp::{get, path, Filter};
 
 use crate::cmd::cmd::BaseRpcConfig;
 use crate::proto::hub_service_client::HubServiceClient;
-use crate::proto::{ContactInfoContentBody, HubInfoRequest, HubInfoResponse};
+use crate::proto::{ContactInfoContentBody, Empty, HubInfoRequest, HubInfoResponse};
 use crate::signals::handle_signals;
 
 const MINIMUM_POLL_INTERVAL_MS: u32 = 3000;
@@ -257,24 +257,27 @@ impl WatchServer {
             let endpoint = hub_conf.load_endpoint()?;
             let mut client = HubServiceClient::connect(endpoint).await?;
 
-            let hub_info_response = client
+            if let Ok(response) = client
                 .get_info(HubInfoRequest { db_stats: false })
                 .await
                 .map_err(|err| {
                     info!("Failed to query hub for peers {}: {:#}", hub_conf.endpoint.clone(), err);
                     Report::new(err)
-                })?;
-            let hub_info = hub_info_response.into_inner();
-
-            self.unique_peers.write().await.insert(
-                hub_conf.clone(),
-                HubInfo {
-                    status: HubStatus::Available,
-                    hub_info,
-                },
-            );
+                }) {
+                let hub_info = response.into_inner();
+                self.unique_peers.write().await.insert(
+                    hub_conf.clone(),
+                    HubInfo {
+                        status: HubStatus::Available,
+                        hub_info,
+                    },
+                );
+            }
         }
 
+        if self.unique_peers.read().await.is_empty() {
+            return Err(eyre!("Failed to initialize any bootstrap peers"));
+        }
         Ok(())
     }
 
@@ -293,17 +296,27 @@ impl WatchServer {
         let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
         for (peer_conf, peer_info) in uniq {
             let peer_id = peer_info.hub_info.peer_id.clone();
-            let endpoint = peer_conf.load_endpoint()?;
-            let mut client = HubServiceClient::connect(endpoint).await?;
 
-            let hub_peers = client
-                .get_current_peers(Request::new(Default::default()))
-                .await
-                .map_err(|err| {
-                    info!("Failed to query hub for peers {}: {:#}", peer_conf.endpoint.clone(), err);
-                    Report::new(err)
-                })?.into_inner();
-            drop(client);
+            let endpoint = match peer_conf.load_endpoint() {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    info!("Failed to load endpoint for peer {}: {:#}", peer_conf.endpoint.clone(), err);
+                    continue;
+                }
+            };
+            let hub_peers = match endpoint.connect().await {
+                Ok(client) => {
+                    if let Ok(response) = HubServiceClient::new(client).get_current_peers(Empty{}).await {
+                        response.into_inner()
+                    } else {
+                        continue
+                    }
+                },
+                Err(err) => {
+                    info!("Failed to connect to peer {}: {:#}", peer_conf.endpoint.clone(), err);
+                    continue;
+                }
+            };
 
             metrics.peers_per_hub.observe(hub_peers.contacts.len() as f64);
 
@@ -322,7 +335,7 @@ impl WatchServer {
                     match SEMAPHORE.acquire().await {
                         Ok(_permit) => {
                             let (conf, endp) = BaseRpcConfig::from_contact_info(&peer).await?;
-                            let mut client = HubServiceClient::connect(endp).await?;
+                            let mut client = HubServiceClient::new(endp.connect().await?);
                             let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
                                 Report::new(err)
                             })?.into_inner();
@@ -335,7 +348,8 @@ impl WatchServer {
                                 });
                                 contacts.write().await.insert(peer, HubStatus::Available);
                             }
-                            drop(client)
+                            // drop(client);
+                            // drop(endp);
                         }
                         Err(err) => {
                             return Err(Report::new(err));
@@ -395,7 +409,7 @@ impl WatchServer {
                 match SEMAPHORE.acquire().await {
                     Ok(_permit) => {
                         let endpoint = peer_conf.load_endpoint()?;
-                        let mut client = HubServiceClient::connect(endpoint).await?;
+                        let mut client = HubServiceClient::new(endpoint.connect().await?);
 
                         match client.get_info(HubInfoRequest {db_stats: true}).await {
                             Ok(response) => {
@@ -410,7 +424,8 @@ impl WatchServer {
                                 return Err(Report::new(err));
                             }
                         }
-                        drop(client);
+                        // drop(client);
+                        // drop(endpoint);
                     }
                     Err(err) => {
                         return Err(Report::new(err));
@@ -436,7 +451,6 @@ impl WatchServer {
                 info!("Error found for peer handler: {:?}", e);
             }
         }
-        info!("{}", SEMAPHORE.available_permits());
 
         Ok(())
     }

@@ -261,7 +261,7 @@ impl SyncMetadataCommand {
 impl SyncSnapshotCommand {
     pub fn execute(&self) -> eyre::Result<()> {
         let rt = Runtime::new().unwrap();
-        
+
 
         rt.block_on(async {
             let tonic_endpoint = self.base.load_endpoint()?;
