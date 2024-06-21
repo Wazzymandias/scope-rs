@@ -30,6 +30,7 @@ fn create_logger() -> Logger {
             }),
         ))
         .build()
+        .filter_level(slog::Level::Info)
         .fuse();
     let drain = Async::new(drain).chan_size(8192).build().fuse();
 

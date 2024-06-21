@@ -16,7 +16,6 @@ use slog::Drain;
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep};
-use tonic::Request;
 use warp::http::Response;
 use warp::{get, path, Filter};
 
@@ -300,7 +299,7 @@ impl WatchServer {
             let endpoint = match peer_conf.load_endpoint() {
                 Ok(endpoint) => endpoint,
                 Err(err) => {
-                    info!("Failed to load endpoint for peer {}: {:#}", peer_conf.endpoint.clone(), err);
+                    info!("Failed to load endpoint for peer {}: {:?} {:#}", peer_conf.endpoint.clone(), err.source(), err);
                     continue;
                 }
             };
@@ -313,7 +312,8 @@ impl WatchServer {
                     }
                 },
                 Err(err) => {
-                    info!("Failed to connect to peer {}: {:#}", peer_conf.endpoint.clone(), err);
+                    let report = Report::new(err);
+                    info!("Failed to connect to peer {}: {:?} {:#}", peer_conf.endpoint.clone(), report.source(), report);
                     continue;
                 }
             };
@@ -348,8 +348,8 @@ impl WatchServer {
                                 });
                                 contacts.write().await.insert(peer, HubStatus::Available);
                             }
-                            // drop(client);
-                            // drop(endp);
+                            drop(client);
+                            drop(endp);
                         }
                         Err(err) => {
                             return Err(Report::new(err));
@@ -409,7 +409,7 @@ impl WatchServer {
                 match SEMAPHORE.acquire().await {
                     Ok(_permit) => {
                         let endpoint = peer_conf.load_endpoint()?;
-                        let mut client = HubServiceClient::new(endpoint.connect().await?);
+                        let mut client = HubServiceClient::new(endpoint.timeout(Duration::from_secs(1)).connect().await?);
 
                         match client.get_info(HubInfoRequest {db_stats: true}).await {
                             Ok(response) => {
@@ -424,8 +424,7 @@ impl WatchServer {
                                 return Err(Report::new(err));
                             }
                         }
-                        // drop(client);
-                        // drop(endpoint);
+                        drop(client);
                     }
                     Err(err) => {
                         return Err(Report::new(err));
@@ -483,7 +482,7 @@ struct Metrics {
     available_hub_count: prometheus::Gauge,
 }
 
-const CONCURRENCY_LIMIT: usize = 1024;
+const CONCURRENCY_LIMIT: usize = 2048;
 static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
 
 impl WatchCommand {

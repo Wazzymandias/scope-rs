@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use clap::Args;
 use eyre::eyre;
 use slog_scope::info;
@@ -13,10 +13,34 @@ struct TimeArgs {
 
     #[arg(long)]
     to_day: Option<String>,
+
+    #[arg(long)]
+    from_hour: Option<String>,
+
+    #[arg(long)]
+    to_hour: Option<String>,
 }
 
 impl TimeArgs {
     pub fn parse_start_and_end_time(&self) -> eyre::Result<(DateTime<Utc>, DateTime<Utc>)> {
+        if let (Some(_), Some(_), Some(_), Some(_)) = (&self.from_hour, &self.to_hour, &self.from_day, &self.to_day) {
+            return Err(eyre!("Cannot specify multiple time ranges"));
+        }
+
+        if let (Some(start), end) = (&self.from_hour, &self.to_hour) {
+            let now = Utc::now().date_naive();
+            let start_time = Utc.from_utc_datetime(
+                &now.and_time(NaiveTime::parse_from_str(start, "%H:%M:%S")?)
+            );
+            let end_time = match end {
+                Some(end) => Utc.from_utc_datetime(
+                    &now.and_time(NaiveTime::parse_from_str(end, "%H:%M:%S")?)
+                ),
+                None => start_time + chrono::Duration::hours(1),
+            };
+            return Ok((start_time, end_time));
+        }
+
         let end_date = match &self.to_day {
             Some(day) => {
                 let date_time = NaiveDate::parse_from_str(day, "%Y-%m-%d")?;

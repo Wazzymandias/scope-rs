@@ -381,7 +381,24 @@ impl HubStateDiffer {
                 .await?
                 .into_inner();
 
-            if metadata.children.is_empty() {
+            // if metadata.children.is_empty() {
+            //     result_sync_ids.push(
+            //         client
+            //             .get_all_sync_ids_by_prefix(TrieNodePrefix {
+            //                 prefix: metadata.prefix,
+            //             })
+            //             .await?
+            //             .into_inner(),
+            //     );
+            // }
+            //
+            // let children = metadata.children.iter().map(|child| {
+            //     let prefix = child.prefix.clone();
+            //     let hash = blake3::hash(prefix.as_slice());
+            //     Item { prefix, hash }
+            // });
+            // queue.write().await.extend(children);
+            if metadata.children.len() <= 1024 {
                 result_sync_ids.push(
                     client
                         .get_all_sync_ids_by_prefix(TrieNodePrefix {
@@ -390,14 +407,14 @@ impl HubStateDiffer {
                         .await?
                         .into_inner(),
                 );
+            } else {
+                let children = metadata.children.iter().map(|child| {
+                    let prefix = child.prefix.clone();
+                    let hash = blake3::hash(prefix.as_slice());
+                    Item { prefix, hash }
+                });
+                queue.write().await.extend(children);
             }
-
-            let children = metadata.children.iter().map(|child| {
-                let prefix = child.prefix.clone();
-                let hash = blake3::hash(prefix.as_slice());
-                Item { prefix, hash }
-            });
-            queue.write().await.extend(children);
 
             cache_entries.push((item.hash.as_bytes().to_vec(), vec![]));
             pending_item.clear();
