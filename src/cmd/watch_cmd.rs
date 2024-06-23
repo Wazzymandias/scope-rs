@@ -331,21 +331,21 @@ impl WatchServer {
         for (peer_conf, peer_info) in uniq {
             let metrics = Arc::clone(&metrics);
             peer_handles.push(tokio::task::spawn(async move {
-                let channel = peer_conf
-                    .load_endpoint()?
-                    .connect_timeout(Duration::from_secs(1))
-                    .timeout(Duration::from_secs(1))
-                    .keep_alive_while_idle(false)
-                    .tcp_nodelay(true)
-                    .keep_alive_timeout(Duration::from_millis(250))
-                    .http2_adaptive_window(true)
-                    .buffer_size(1024 * 1024 * 10)
-                    .tcp_keepalive(None)
-                    .connect().await?;
-                HubServiceClient::new(channel).get_current_peers(Empty{})
-                    .await
-                    .map(|response| response.into_inner())
-                    .map_err(|err| Report::new(err))
+                let timeout = Duration::from_secs(3);
+                tokio::select! {
+                    result = async {
+                        let channel = peer_conf.load_endpoint()?.connect().await?;
+                        HubServiceClient::new(channel).get_current_peers(Empty {})
+                            .await
+                            .map(|response| response.into_inner())
+                            .map_err(|err| Report::new(err))
+                    } => {
+                        result
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        Err(eyre!("Timeout waiting for response from peer"))
+                    }
+                }
             }))
         }
 
@@ -390,31 +390,33 @@ impl WatchServer {
             let metrics = Arc::clone(&metrics);
 
             peer_handles.push(tokio::task::spawn(async move {
-                let (conf, endp) = BaseRpcConfig::from_contact_info(&contact.inner).await?;
-                let response = HubServiceClient::connect(
-                    endp
-                        .connect_timeout(Duration::from_secs(1))
-                        .http2_adaptive_window(true)
-                        .timeout(Duration::from_secs(1))
-                        .keep_alive_while_idle(false)
-                        .tcp_nodelay(true)
-                        .keep_alive_timeout(Duration::from_millis(250))
-                        .tcp_keepalive(None))
-                    .await?
-                    .get_info(HubInfoRequest {db_stats: true})
-                    .await?
-                    .into_inner();
+                let timeout = Duration::from_secs(3);
+                tokio::select! {
+                    result = async {
+                        let (conf, endp) = BaseRpcConfig::from_contact_info(&contact.inner).await?;
+                        let response = HubServiceClient::connect(endp)
+                            .await?
+                            .get_info(HubInfoRequest {db_stats: true})
+                            .await?
+                            .into_inner();
 
-                if let Some(db_stats) = &response.db_stats {
-                    metrics.total_fid_events_histogram.observe(db_stats.num_fid_events as f64);
-                    metrics.total_fname_events_histogram.observe(db_stats.num_fname_events as f64);
-                    metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
+                        if let Some(db_stats) = &response.db_stats {
+                            metrics.total_fid_events_histogram.observe(db_stats.num_fid_events as f64);
+                            metrics.total_fname_events_histogram.observe(db_stats.num_fname_events as f64);
+                            metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
+                        }
+
+                        Ok((conf, HubInfo {
+                            status: HubStatus::Available,
+                            hub_info: response.clone(),
+                        }))
+                    } => {
+                        result
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        Err(eyre!("Timeout waiting for response from peer"))
+                    }
                 }
-
-                Ok((conf, HubInfo {
-                    status: HubStatus::Available,
-                    hub_info: response.clone(),
-                }))
             }))
         }
 

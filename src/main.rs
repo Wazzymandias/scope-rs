@@ -7,6 +7,7 @@ use clap::Parser;
 use slog::{Drain, Logger, o, PushFnValue, Record};
 use slog_async::Async;
 use slog_json::Json;
+use console_subscriber;
 
 use crate::cmd::cmd::Command;
 
@@ -38,6 +39,7 @@ fn create_logger() -> Logger {
 }
 
 fn main() {
+    console_subscriber::init();
     // Create the global logger
     let logger = create_logger();
     let _guard = slog_scope::set_global_logger(logger);

@@ -39,6 +39,7 @@ prometheus = "0.13.4"
 warp = "0.3.7"
 log = "0.4.21"
 rand = "0.8.5"
+console-subscriber = "0.3.0"
 
 [profile.dev]
 incremental = true
