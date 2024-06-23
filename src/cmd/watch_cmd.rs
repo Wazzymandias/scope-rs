@@ -7,11 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::process::exit;
 use std::string::ToString;
-use std::sync::atomic::{AtomicBool};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, LazyLock};
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
+use futures::{FutureExt, TryFutureExt};
 use prometheus::core::Atomic;
+use rand::seq::IteratorRandom;
 use slog::Drain;
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -25,8 +27,15 @@ use crate::proto::{ContactInfoContentBody, Empty, HubInfoRequest, HubInfoRespons
 use crate::signals::handle_signals;
 
 const MINIMUM_POLL_INTERVAL_MS: u32 = 3000;
+const CONCURRENCY_LIMIT: usize = 512;
+static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
 
-type UnavailableHubSet = HashSet<ContactInfoContentBody>;
+#[derive(Clone, Debug)]
+struct HubContact {
+    inner: ContactInfoContentBody,
+}
+
+type UnavailableHubSet = HashSet<HubContact>;
 
 fn default_mainnet_bootstrap_peers() -> [BaseRpcConfig; 3] {
     [
@@ -57,13 +66,23 @@ fn default_mainnet_bootstrap_peers() -> [BaseRpcConfig; 3] {
     ]
 }
 
-impl Eq for ContactInfoContentBody{
+impl PartialEq for HubContact{
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.gossip_address == other.inner.gossip_address &&
+            self.inner.rpc_address == other.inner.rpc_address &&
+            self.inner.hub_version == other.inner.hub_version &&
+            self.inner.network == other.inner.network &&
+            self.inner.app_version == other.inner.app_version
+    }
+}
+
+impl Eq for HubContact{
 
 }
 
-impl Hash for ContactInfoContentBody{
+impl Hash for HubContact {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        for addr in [&self.gossip_address, &self.rpc_address].iter() {
+        for addr in [&self.inner.gossip_address, &self.inner.rpc_address].iter() {
             addr.as_ref().map(|info| {
                 info.address.hash(state);
                 info.family.hash(state);
@@ -72,15 +91,9 @@ impl Hash for ContactInfoContentBody{
             }).unwrap_or_else(|| 0.hash(state));
         }
 
-        for hash in &self.excluded_hashes {
-            hash.hash(state);
-        }
-
-        self.count.hash(state);
-        self.hub_version.hash(state);
-        self.network.hash(state);
-        self.app_version.hash(state);
-        self.timestamp.hash(state);
+        self.inner.hub_version.hash(state);
+        self.inner.network.hash(state);
+        self.inner.app_version.hash(state);
     }
 }
 
@@ -174,7 +187,7 @@ impl WatchServer {
                         // Scope to automatically release the permit after use
                         {
                             info!("Starting new scan of peers in the network", );
-                            self.watch_peers().await?;
+                            WatchServer::traverse_peers(Arc::clone(&self.metrics), Arc::clone(&self.unique_peers), Arc::clone(&self.unavailable_peers)).await?;
                         }
                     } else {
                         info!("Skipping tick as previous task is still running",);
@@ -280,175 +293,168 @@ impl WatchServer {
         Ok(())
     }
 
+    async fn find_unique_contacts(
+        metrics: Arc<Metrics>,
+        unique_peers: Arc<RwLock<HubUniquePeers>>
+    ) -> eyre::Result<HashSet<HubContact>> {
+        let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
+
+        info!("Attempting to read unique peers",);
+        let mut uniq: Vec<(BaseRpcConfig, HubInfo)> = vec![];
+        {
+            let read_guard = unique_peers.read().await;
+            if read_guard.is_empty() {
+                return Err(eyre!("No unique peers found"));
+            }
+
+            if read_guard.len() <= 25 {
+                uniq.extend(read_guard.iter().map(|(conf, info)| (conf.clone(), info.clone())));
+            } else {
+                let keys = read_guard.keys().cloned().collect::<Vec<BaseRpcConfig>>();
+                let mut rng = rand::thread_rng();
+                let sample = rand::seq::index::sample(&mut rng, keys.len(), 100);
+                sample.iter().for_each(|idx| {
+                    let key = &keys[idx];
+                    if let Some(info) = read_guard.get(key) {
+                        uniq.push((key.clone(), info.clone()));
+                    }
+                });
+            }
+        }
+        // let uniq: Vec<(BaseRpcConfig, HubInfo)> = unique_peers.read()
+        //     .await
+        //     .iter()
+        //     .map(|(conf, info)| (conf.clone(), info.clone()))
+        //     .collect();
+        info!("Read unique peers [{}]", uniq.len());
+
+        for (peer_conf, peer_info) in uniq {
+            let metrics = Arc::clone(&metrics);
+            peer_handles.push(tokio::task::spawn(async move {
+                let channel = peer_conf
+                    .load_endpoint()?
+                    .connect_timeout(Duration::from_secs(1))
+                    .timeout(Duration::from_secs(1))
+                    .keep_alive_while_idle(false)
+                    .tcp_nodelay(true)
+                    .keep_alive_timeout(Duration::from_millis(250))
+                    .http2_adaptive_window(true)
+                    .buffer_size(1024 * 1024 * 10)
+                    .tcp_keepalive(None)
+                    .connect().await?;
+                HubServiceClient::new(channel).get_current_peers(Empty{})
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|err| Report::new(err))
+            }))
+        }
+
+        let results = futures::future::join_all(peer_handles).await;
+
+        let mut uniq_contacts = HashSet::new();
+        for res in results {
+            match res {
+                Ok(Ok(contacts)) => {
+                    metrics.peers_per_hub.observe(contacts.contacts.len() as f64);
+                    uniq_contacts.extend(
+                        contacts
+                            .contacts
+                            .into_iter()
+                            .map(|contact| HubContact{ inner: contact })
+                    );
+                },
+                Ok(Err(err)) => {
+                    info!("Error found on finding unique contacts: {:#}", err);
+                },
+                Err(err) => {
+                    info!("Join error found on finding unique contacts: {:#}", err);
+                }
+            }
+        }
+
+        Ok(uniq_contacts)
+    }
+
     async fn traverse_peers(
         metrics: Arc<Metrics>,
         unique_peers: Arc<RwLock<HubUniquePeers>>,
         unavailable_peers: Arc<RwLock<UnavailableHubSet>>,
     ) -> eyre::Result<()> {
-        let current_peer_set = Arc::new(RwLock::new(HubUniquePeers::new()));
+        let unique_contacts = WatchServer::find_unique_contacts(Arc::clone(&metrics), Arc::clone(&unique_peers)).await?;
+        let total = unique_contacts.len();
 
-        let uniq: Vec<(BaseRpcConfig, HubInfo)> = unique_peers.read().await.iter().map(|(k, v)| {
-            (k.clone(), v.clone())
-        }).collect();
-        let contacts_set: Arc<RwLock<HashMap<ContactInfoContentBody, HubStatus>>>= Arc::new(RwLock::new(HashMap::new()));
+        let uniq = unique_contacts.iter().map(|entry| entry.clone()).choose_multiple(&mut rand::thread_rng(), 512);
 
         let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
-        for (peer_conf, peer_info) in uniq {
-            let peer_id = peer_info.hub_info.peer_id.clone();
-
-            let endpoint = match peer_conf.load_endpoint() {
-                Ok(endpoint) => endpoint,
-                Err(err) => {
-                    info!("Failed to load endpoint for peer {}: {:?} {:#}", peer_conf.endpoint.clone(), err.source(), err);
-                    continue;
-                }
-            };
-            let hub_peers = match endpoint.connect().await {
-                Ok(client) => {
-                    if let Ok(response) = HubServiceClient::new(client).get_current_peers(Empty{}).await {
-                        response.into_inner()
-                    } else {
-                        continue
-                    }
-                },
-                Err(err) => {
-                    let report = Report::new(err);
-                    info!("Failed to connect to peer {}: {:?} {:#}", peer_conf.endpoint.clone(), report.source(), report);
-                    continue;
-                }
-            };
-
-            metrics.peers_per_hub.observe(hub_peers.contacts.len() as f64);
-
-            for peer in hub_peers.contacts {
-                if contacts_set.read().await.get(&peer).is_some_and(|status| *status == HubStatus::Available || *status == HubStatus::Unavailable) {
-                    continue;
-                }
-                contacts_set.write().await.insert(peer.clone(), HubStatus::Unknown);
-
-                let current_peer_set = Arc::clone(&current_peer_set);
-                let peer = peer.clone();
-                let peer_addr = peer.gossip_address.clone().unwrap().address;
-                let contacts = Arc::clone(&contacts_set);
-
-                peer_handles.push(tokio::task::spawn(async move {
-                    match SEMAPHORE.acquire().await {
-                        Ok(_permit) => {
-                            let (conf, endp) = BaseRpcConfig::from_contact_info(&peer).await?;
-                            let mut client = HubServiceClient::new(endp.connect().await?);
-                            let info = client.get_info(HubInfoRequest { db_stats: false }).await.map_err(|err| {
-                                Report::new(err)
-                            })?.into_inner();
-
-                            {
-                                let mut lock = current_peer_set.write().await;
-                                lock.entry(conf).or_insert(HubInfo {
-                                    status: HubStatus::Available,
-                                    hub_info: info,
-                                });
-                                contacts.write().await.insert(peer, HubStatus::Available);
-                            }
-                            drop(client);
-                            drop(endp);
-                        }
-                        Err(err) => {
-                            return Err(Report::new(err));
-                        }
-                    }
-
-                    Ok(())
-                }))
-            }
-        }
-
-        let results = futures::future::join_all(peer_handles).await;
-        for res in results {
-            if let Err(err) = res {
-                info!("Join error found on traversing peers: {:#}", err);
-            } else if let Ok(Err(err)) = res {
-                info!("Error found traversing peers: {:#}", err);
-            }
-        }
-
-        {
-            let mut uniqp = unique_peers.write().await;
-            current_peer_set.write().await.drain().for_each(|(k, v)| {
-                uniqp.insert(k, v);
-            });
-        }
-
-        {
-            let contacts = contacts_set.read().await;
-            let available = contacts.iter().filter(|(_, status)| **status == HubStatus::Available).count();
-            let unavailable = contacts.iter().filter(|(_, status)| **status == HubStatus::Unavailable).count();
-            let unknown = contacts.iter().filter(|(_, status)| **status == HubStatus::Unknown).count();
-            let total_hub_count = contacts.len();
-            info!("contacts: {} {} {} {}", total_hub_count, available, unavailable, unknown);
-            metrics.total_hub_count.set(total_hub_count as f64);
-            metrics.available_hub_count.set(available as f64);
-            metrics.unavailable_hub_count.set((unavailable + unknown) as f64);
-        }
-
-        Ok(())
-    }
-
-    async fn watch_peers(&self) -> eyre::Result<()> {
-        let unique_peers = Arc::clone(&self.unique_peers);
-        let uniq: Vec<(BaseRpcConfig, HubInfo)> = unique_peers.read().await.iter().map(|(k, v)| {
-            (k.clone(), v.clone())
-        }).collect();
-
-
-        let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
-        for (peer_conf, peer_info) in uniq {
-            let metrics = Arc::clone(&self.metrics);
-            let peer_conf = peer_conf.clone();
-            let uniqp = Arc::clone(&unique_peers);
+        for contact in uniq {
+            let metrics = Arc::clone(&metrics);
 
             peer_handles.push(tokio::task::spawn(async move {
-                match SEMAPHORE.acquire().await {
-                    Ok(_permit) => {
-                        let endpoint = peer_conf.load_endpoint()?;
-                        let mut client = HubServiceClient::new(endpoint.timeout(Duration::from_secs(1)).connect().await?);
+                let (conf, endp) = BaseRpcConfig::from_contact_info(&contact.inner).await?;
+                let response = HubServiceClient::connect(
+                    endp
+                        .connect_timeout(Duration::from_secs(1))
+                        .http2_adaptive_window(true)
+                        .timeout(Duration::from_secs(1))
+                        .keep_alive_while_idle(false)
+                        .tcp_nodelay(true)
+                        .keep_alive_timeout(Duration::from_millis(250))
+                        .tcp_keepalive(None))
+                    .await?
+                    .get_info(HubInfoRequest {db_stats: true})
+                    .await?
+                    .into_inner();
 
-                        match client.get_info(HubInfoRequest {db_stats: true}).await {
-                            Ok(response) => {
-                                if let Some(db_stats) = response.into_inner().db_stats {
-                                    metrics.total_fid_events_histogram.observe(db_stats.num_fid_events as f64);
-                                    metrics.total_fname_events_histogram.observe(db_stats.num_fname_events as f64);
-                                    metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
-                                }
-                            }
-                            Err(err) => {
-                                // info!("Failed to query hub {:#}: {:#}", peer_conf.endpoint.clone(), err);
-                                return Err(Report::new(err));
-                            }
-                        }
-                        drop(client);
-                    }
-                    Err(err) => {
-                        return Err(Report::new(err));
-                    }
+                if let Some(db_stats) = &response.db_stats {
+                    metrics.total_fid_events_histogram.observe(db_stats.num_fid_events as f64);
+                    metrics.total_fname_events_histogram.observe(db_stats.num_fname_events as f64);
+                    metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
                 }
 
-                Ok(())
+                Ok((conf, HubInfo {
+                    status: HubStatus::Available,
+                    hub_info: response.clone(),
+                }))
             }))
         }
 
-        let met = Arc::clone(&self.metrics);
-        let uniqp = Arc::clone(&self.unique_peers);
-        let unavp = Arc::clone(&self.unavailable_peers);
-        peer_handles.push(tokio::task::spawn(async move {
-            WatchServer::traverse_peers(met, uniqp, unavp).await
-        }));
+        let results = futures::future::join_all(peer_handles).await;
+        let available = AtomicU32::new(0);
+        let unavailable = AtomicU32::new(0);
+        let mut errors = Vec::new();
 
-        let result = futures::future::join_all(peer_handles).await;
-        for res in result {
-            if let Err(e) = res {
-                info!("Join error found on watch peers: {:?}", e);
-            } else if let Ok(Err(e)) = res {
-                info!("Error found for peer handler: {:?}", e);
+        let mut output = vec![];
+        for res in results {
+            match res {
+                Ok(Ok((conf, info))) => {
+                    output.push((conf, info));
+                    available.fetch_add(1, SeqCst);
+                },
+                Ok(Err(err)) => {
+                    errors.push(err);
+                    unavailable.fetch_add(1, SeqCst);
+                },
+                Err(err) => {
+                    errors.push(Report::new(err));
+                    unavailable.fetch_add(1, SeqCst);
+                }
             }
+        }
+
+        let error_str = errors.iter().map(|err| err.to_string()).collect::<Vec<String>>().join("\n");
+        info!("Finished scanning peers [errors: {:#}]", error_str);
+
+        {
+            unique_peers.write().await.extend(output);
+
+            let available = available.load(SeqCst);
+            let unavailable = unavailable.load(SeqCst);
+            let unknown = (total as u32) - available - unavailable;
+            info!("Updated contacts: [total: {}] [available: {}] [unavailable: {}] [unknown: {}]",
+                total, available, unavailable, unknown);
+            metrics.total_hub_count.set(total as f64);
+            metrics.available_hub_count.set(available as f64);
+            metrics.unavailable_hub_count.set((unavailable + unknown) as f64);
         }
 
         Ok(())
@@ -481,9 +487,6 @@ struct Metrics {
     unavailable_hub_count: prometheus::Gauge,
     available_hub_count: prometheus::Gauge,
 }
-
-const CONCURRENCY_LIMIT: usize = 2048;
-static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
 
 impl WatchCommand {
     pub async fn execute(&self) -> eyre::Result<()> {

@@ -398,7 +398,7 @@ impl HubStateDiffer {
             //     Item { prefix, hash }
             // });
             // queue.write().await.extend(children);
-            if metadata.children.len() <= 1024 {
+            if metadata.num_messages <= 1024 {
                 result_sync_ids.push(
                     client
                         .get_all_sync_ids_by_prefix(TrieNodePrefix {

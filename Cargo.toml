@@ -37,6 +37,8 @@ duckdb = { version = "0.10.2", features = ["bundled"] }
 histo = "1.0.0"
 prometheus = "0.13.4"
 warp = "0.3.7"
+log = "0.4.21"
+rand = "0.8.5"
 
 [profile.dev]
 incremental = true
