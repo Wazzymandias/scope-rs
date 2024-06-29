@@ -47,7 +47,8 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()
-        .max_blocking_threads(1024)  // Increase the blocking thread pool size
+        .max_blocking_threads(2048)  // Increase the blocking thread pool size
+        .max_io_events_per_tick(2048)  // Increase the number of IO events per tick
         .build()
         .unwrap();
 

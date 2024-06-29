@@ -1,8 +1,8 @@
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::str::FromStr;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, CommandFactory, Parser};
@@ -17,11 +17,12 @@ use crate::cmd::messages_cmd::MessagesCommand;
 use crate::cmd::parse_cmd::ParseCommand;
 use crate::cmd::peers_cmd::PeersCommand;
 use crate::cmd::sync_ids_cmd::SyncIdsCommand;
+use crate::cmd::sync_metadata_cmd::SyncMetadataCommand;
 use crate::cmd::watch_cmd::WatchCommand;
 use crate::proto::{ContactInfoContentBody, Message, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
 
-#[derive(Debug, Args, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Args, Clone)]
 pub(crate) struct BaseRpcConfig {
     #[arg(long)]
     #[arg(default_value = "true")]
@@ -38,8 +39,34 @@ pub(crate) struct BaseRpcConfig {
     pub(crate) endpoint: String,
 }
 
+impl PartialEq for BaseRpcConfig {
+    fn eq(&self, other: &Self) -> bool {
+            self.port == other.port &&
+            self.endpoint == other.endpoint
+    }
+}
+
+impl Eq for BaseRpcConfig {}
+
+impl Hash for BaseRpcConfig {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.port.hash(state);
+        self.endpoint.hash(state);
+    }
+}
 
 impl BaseRpcConfig {
+    pub fn url(&self) -> String {
+        let protocol = if self.https {
+            "https"
+        } else if self.http {
+            "http"
+        } else {
+            return "".to_string();
+        };
+        format!("{}://{}:{}", protocol, self.endpoint, self.port)
+    }
+
     pub fn load_endpoint(&self) -> eyre::Result<Endpoint> {
         let protocol = if self.https {
             "https"
@@ -53,31 +80,31 @@ impl BaseRpcConfig {
             protocol, self.endpoint, self.port
         );
 
-        if self.https {
-            Ok(Endpoint::from_str(endpoint.as_str())
-                .unwrap()
-                .keep_alive_while_idle(false)
-                .tcp_keepalive(None)
-                .timeout(Duration::from_secs(2))
-                .http2_adaptive_window(true)
-                .connect_timeout(Duration::from_secs(2))
-                .concurrency_limit(1024)
-                .buffer_size(1024 * 1024 * 100)
-                .tcp_nodelay(true)
-                // .tls_config(get_tls_config().clone())
-                // .unwrap())
-            )
-        } else {
-            Ok(Endpoint::from_str(endpoint.as_str()).unwrap()
-                .keep_alive_while_idle(false)
-                .tcp_keepalive(None)
-                .http2_adaptive_window(true)
-                .timeout(Duration::from_secs(2))
-                .concurrency_limit(1024)
-                .buffer_size(1024 * 1024 * 100)
-                .tcp_nodelay(true)
-                .connect_timeout(Duration::from_secs(2)))
-        }
+        // if self.https {
+        //     Ok(Endpoint::from_str(endpoint.as_str())
+        //         .unwrap()
+        //         .keep_alive_while_idle(false)
+        //         .tcp_keepalive(None)
+        //         .tcp_nodelay(true)
+        //         // .tls_config(get_tls_config().clone())
+        //         // .unwrap()
+        //     )
+        // } else {
+        //     Ok(Endpoint::from_str(endpoint.as_str())
+        //         .unwrap()
+        //         .keep_alive_while_idle(false)
+        //         .tcp_keepalive(None)
+        //         .tcp_nodelay(true)
+        //     )
+        // }
+        Ok(Endpoint::from_str(endpoint.as_str())
+               .unwrap()
+               .keep_alive_while_idle(false)
+               .tcp_keepalive(None)
+               .tcp_nodelay(true)
+           // .tls_config(get_tls_config().clone())
+           // .unwrap()
+        )
     }
     pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<(Self, Endpoint)> {
         match contact_info.rpc_address.as_ref() {
@@ -150,22 +177,6 @@ pub enum SubCommands {
 }
 
 #[derive(Args, Debug)]
-pub struct SyncMetadataCommand {
-    #[clap(flatten)]
-    base: BaseRpcConfig,
-
-    #[arg(long)]
-    endpoint: String,
-
-    #[arg(long)]
-    sync_id: Option<String>,
-
-    /// Sets the prefix as a comma-separated string of bytes, e.g., --prefix 48,48,51
-    #[arg(long)]
-    prefix: Option<String>, // Use Option if prefix is optional
-}
-
-#[derive(Args, Debug)]
 pub struct SyncSnapshotCommand {
     #[clap(flatten)]
     base: BaseRpcConfig,
@@ -188,7 +199,7 @@ pub(crate) fn parse_prefix(input: &Option<String>) -> Result<Vec<u8>, std::num::
             if input.is_empty() {
                 Ok(vec![])
             } else {
-                input.split(',').map(|s| s.trim().parse()).collect()
+                input.trim().trim_start_matches('[').trim_end_matches(']').split(',').map(|s| s.trim().parse()).collect()
             }
         }
     }
@@ -233,30 +244,6 @@ impl Command {
             }
         }
         Ok(())
-    }
-}
-
-impl SyncMetadataCommand {
-    pub async fn execute(&self) -> eyre::Result<()> {
-        let tonic_endpoint = self.base.load_endpoint()?;
-        let mut client = HubServiceClient::connect(tonic_endpoint).await.unwrap();
-        let prefix = parse_prefix(&self.prefix)?;
-
-        let response = client
-            .get_sync_metadata_by_prefix(tonic::Request::new(TrieNodePrefix { prefix }))
-            .await
-            .unwrap();
-
-        let str_response = serde_json::to_string_pretty(&response.into_inner());
-        if str_response.is_err() {
-            return Err(eyre!("{:?}", str_response.err()));
-        }
-
-        Ok(println!("{}", str_response.unwrap()))
-        // println!(
-        //     "default: {}",
-        //     serde_json::to_string_pretty(&TrieNodeMetadataResponse::default()).unwrap()
-        // );
     }
 }
 

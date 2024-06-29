@@ -21,7 +21,7 @@ pub fn vec_to_farcaster_timestamp(input: Vec<u8>) -> u32 {
     }
     let ts_bytes = &input[..TIMESTAMP_LENGTH];
     let ts_str = String::from_utf8(ts_bytes.to_vec()).unwrap();
-    ts_str.parse::<u32>().unwrap()
+    (FARCASTER_EPOCH + ts_str.parse::<u32>().unwrap() as u64) as u32
 }
 
 pub fn farcaster_time_to_str(timestamp: u32) -> String {

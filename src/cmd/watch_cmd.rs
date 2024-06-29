@@ -13,7 +13,6 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use futures::{FutureExt, TryFutureExt};
 use prometheus::core::Atomic;
-use rand::seq::IteratorRandom;
 use slog::Drain;
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -26,7 +25,7 @@ use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{ContactInfoContentBody, Empty, HubInfoRequest, HubInfoResponse};
 use crate::signals::handle_signals;
 
-const MINIMUM_POLL_INTERVAL_MS: u32 = 3000;
+const MINIMUM_POLL_INTERVAL_MS: u32 = 5000;
 const CONCURRENCY_LIMIT: usize = 512;
 static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
 
@@ -34,8 +33,6 @@ static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRE
 struct HubContact {
     inner: ContactInfoContentBody,
 }
-
-type UnavailableHubSet = HashSet<HubContact>;
 
 fn default_mainnet_bootstrap_peers() -> [BaseRpcConfig; 3] {
     [
@@ -68,11 +65,12 @@ fn default_mainnet_bootstrap_peers() -> [BaseRpcConfig; 3] {
 
 impl PartialEq for HubContact{
     fn eq(&self, other: &Self) -> bool {
-        self.inner.gossip_address == other.inner.gossip_address &&
-            self.inner.rpc_address == other.inner.rpc_address &&
-            self.inner.hub_version == other.inner.hub_version &&
-            self.inner.network == other.inner.network &&
-            self.inner.app_version == other.inner.app_version
+        // self.inner.gossip_address == other.inner.gossip_address &&
+        //     self.inner.rpc_address == other.inner.rpc_address &&
+        //     self.inner.hub_version == other.inner.hub_version &&
+        //     self.inner.network == other.inner.network &&
+        //     self.inner.app_version == other.inner.app_version
+        self.inner.rpc_address == other.inner.rpc_address
     }
 }
 
@@ -82,18 +80,19 @@ impl Eq for HubContact{
 
 impl Hash for HubContact {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        for addr in [&self.inner.gossip_address, &self.inner.rpc_address].iter() {
-            addr.as_ref().map(|info| {
-                info.address.hash(state);
-                info.family.hash(state);
-                info.port.hash(state);
-                info.dns_name.hash(state);
-            }).unwrap_or_else(|| 0.hash(state));
-        }
-
-        self.inner.hub_version.hash(state);
-        self.inner.network.hash(state);
-        self.inner.app_version.hash(state);
+        // for addr in [self.inner.gossip_address.as_ref(), self.inner.rpc_address.as_ref()].iter() {
+        //     addr.as_ref().map(|&info| {
+        //         info.address.hash(state);
+        //         info.family.hash(state);
+        //         info.port.hash(state);
+        //         info.dns_name.hash(state);
+        //     }).unwrap_or_else(|| 0.hash(state));
+        // }
+        //
+        // self.inner.hub_version.hash(state);
+        // self.inner.network.hash(state);
+        // self.inner.app_version.hash(state);
+        self.inner.rpc_address.as_ref().unwrap().address.hash(state);
     }
 }
 
@@ -115,8 +114,8 @@ struct WatchServer {
 
     poll_interval_duration: Duration,
 
-    unavailable_peers: Arc<RwLock<UnavailableHubSet>>,
     unique_peers: Arc<RwLock<HubUniquePeers>>,
+    unreachable_peers: Arc<RwLock<HashMap<BaseRpcConfig, String>>>,
 }
 
 impl WatchServer {
@@ -137,8 +136,8 @@ impl WatchServer {
             metrics_registry: registry,
             poll_interval_duration: Duration::from_millis(poll_interval_ms as u64),
 
-            unavailable_peers: Arc::new(RwLock::new(UnavailableHubSet::new())),
             unique_peers: Arc::new(RwLock::new(HubUniquePeers::new())),
+            unreachable_peers: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -187,7 +186,7 @@ impl WatchServer {
                         // Scope to automatically release the permit after use
                         {
                             info!("Starting new scan of peers in the network", );
-                            WatchServer::traverse_peers(Arc::clone(&self.metrics), Arc::clone(&self.unique_peers), Arc::clone(&self.unavailable_peers)).await?;
+                            WatchServer::traverse_peers(Arc::clone(&self.metrics), Arc::clone(&self.unique_peers), Arc::clone(&self.unreachable_peers)).await?;
                         }
                     } else {
                         info!("Skipping tick as previous task is still running",);
@@ -229,6 +228,11 @@ impl WatchServer {
             "Total number of hubs that are currently available"
         ))?;
 
+        let total_unique_endpoints = prometheus::Gauge::with_opts(opts!(
+            "total_unique_endpoints",
+            "Total number of unique endpoints found"
+        ))?;
+
         let available_hub_count = prometheus::Gauge::with_opts(opts!(
             "total_hub_count_available",
             "Total number of hubs that are currently available"
@@ -239,6 +243,11 @@ impl WatchServer {
             "Total number of hubs that are currently unavailable"
         ))?;
 
+        let peer_address_change_count = prometheus::Counter::with_opts(opts!(
+            "peer_address_change_count",
+            "Total number of times a peer's address has changed"
+        ))?;
+
         let registry = prometheus::default_registry();
 
         registry.register(Box::new(peers_per_hub.clone()))?;
@@ -246,8 +255,10 @@ impl WatchServer {
         registry.register(Box::new(total_fname_events_histogram.clone()))?;
         registry.register(Box::new(total_hub_count.clone()))?;
         registry.register(Box::new(total_messages_histogram.clone()))?;
+        registry.register(Box::new(total_unique_endpoints.clone()))?;
         registry.register(Box::new(available_hub_count.clone()))?;
         registry.register(Box::new(unavailable_hub_count.clone()))?;
+        registry.register(Box::new(peer_address_change_count.clone()))?;
 
         Ok((
             registry,
@@ -257,8 +268,10 @@ impl WatchServer {
                 total_fname_events_histogram,
                 total_hub_count,
                 total_messages_histogram,
+                total_unique_endpoints,
                 available_hub_count,
                 unavailable_hub_count,
+                peer_address_change_count,
             },
         ))
     }
@@ -278,10 +291,11 @@ impl WatchServer {
                 }) {
                 let hub_info = response.into_inner();
                 self.unique_peers.write().await.insert(
-                    hub_conf.clone(),
+                    hub_info.peer_id.clone(),
                     HubInfo {
                         status: HubStatus::Available,
                         hub_info,
+                        rpc_config: hub_conf.clone(),
                     },
                 );
             }
@@ -295,73 +309,88 @@ impl WatchServer {
 
     async fn find_unique_contacts(
         metrics: Arc<Metrics>,
-        unique_peers: Arc<RwLock<HubUniquePeers>>
+        unique_peers: Arc<RwLock<HubUniquePeers>>,
+        unreachable: Arc<RwLock<HashMap<BaseRpcConfig, String>>>
     ) -> eyre::Result<HashSet<HubContact>> {
         let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
 
         info!("Attempting to read unique peers",);
-        let mut uniq: Vec<(BaseRpcConfig, HubInfo)> = vec![];
-        {
-            let read_guard = unique_peers.read().await;
-            if read_guard.is_empty() {
-                return Err(eyre!("No unique peers found"));
-            }
-
-            if read_guard.len() <= 25 {
-                uniq.extend(read_guard.iter().map(|(conf, info)| (conf.clone(), info.clone())));
-            } else {
-                let keys = read_guard.keys().cloned().collect::<Vec<BaseRpcConfig>>();
-                let mut rng = rand::thread_rng();
-                let sample = rand::seq::index::sample(&mut rng, keys.len(), 100);
-                sample.iter().for_each(|idx| {
-                    let key = &keys[idx];
-                    if let Some(info) = read_guard.get(key) {
-                        uniq.push((key.clone(), info.clone()));
-                    }
-                });
-            }
-        }
-        // let uniq: Vec<(BaseRpcConfig, HubInfo)> = unique_peers.read()
-        //     .await
-        //     .iter()
-        //     .map(|(conf, info)| (conf.clone(), info.clone()))
-        //     .collect();
+        // let mut uniq: Vec<(BaseRpcConfig, HubInfo)> = vec![];
+        // {
+        //     let read_guard = unique_peers.read().await;
+        //     if read_guard.is_empty() {
+        //         return Err(eyre!("No unique peers found"));
+        //     }
+        //
+        //     if read_guard.len() <= 25 {
+        //         uniq.extend(read_guard.iter().map(|(conf, info)| (conf.clone(), info.clone())));
+        //     } else {
+        //         let keys = read_guard.keys().cloned().collect::<Vec<BaseRpcConfig>>();
+        //         let mut rng = rand::thread_rng();
+        //         let sample = rand::seq::index::sample(&mut rng, keys.len(), 100);
+        //         sample.iter().for_each(|idx| {
+        //             let key = &keys[idx];
+        //             if let Some(info) = read_guard.get(key) {
+        //                 uniq.push((key.clone(), info.clone()));
+        //             }
+        //         });
+        //     }
+        // }
+        let uniq: HashMap<String, HubInfo> = unique_peers.read()
+            .await
+            .iter()
+            .map(|(peer_id, info)| (peer_id.clone(), info.clone()))
+            .collect();
         info!("Read unique peers [{}]", uniq.len());
 
-        for (peer_conf, peer_info) in uniq {
+        let semaphore = Arc::new(Semaphore::new(256));
+        for (peer_id, peer_info) in uniq.iter() {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let metrics = Arc::clone(&metrics);
+            let peer_id = peer_id.clone();
+            let peer_info = peer_info.clone();
+            let unreachable = Arc::clone(&unreachable);
+
             peer_handles.push(tokio::task::spawn(async move {
-                let timeout = Duration::from_secs(3);
-                tokio::select! {
+                let timeout = Duration::from_secs(5);
+                let result = tokio::select! {
                     result = async {
-                        let channel = peer_conf.load_endpoint()?.connect().await?;
+                        let channel = peer_info.rpc_config.load_endpoint()?.connect().await?;
                         HubServiceClient::new(channel).get_current_peers(Empty {})
                             .await
                             .map(|response| response.into_inner())
                             .map_err(|err| Report::new(err))
                     } => {
+                        if result.is_err() {
+                            unreachable.write().await.insert(peer_info.rpc_config.clone(), peer_id);
+                        }
                         result
                     }
                     _ = tokio::time::sleep(timeout) => {
                         Err(eyre!("Timeout waiting for response from peer"))
                     }
-                }
+                };
+
+                drop(permit);
+                result
             }))
         }
 
         let results = futures::future::join_all(peer_handles).await;
+        let known_unreachable = unreachable.read().await.len();
+        info!("Finished scanning peers [unreachable: {}]", known_unreachable);
 
         let mut uniq_contacts = HashSet::new();
+        let mut uniq_rpc: HashSet<String> = HashSet::new();
         for res in results {
             match res {
                 Ok(Ok(contacts)) => {
                     metrics.peers_per_hub.observe(contacts.contacts.len() as f64);
-                    uniq_contacts.extend(
-                        contacts
-                            .contacts
-                            .into_iter()
-                            .map(|contact| HubContact{ inner: contact })
-                    );
+                    uniq_rpc.extend(contacts.contacts.iter().map(|contact| format!("{}:{}", contact.clone().rpc_address.unwrap().address.clone(), contact.clone().rpc_address.unwrap().port)));
+                    let input = contacts.contacts.into_iter()
+                        .map(|contact| HubContact{ inner: contact })
+                        .filter(|contact| !uniq_contacts.contains(contact)).collect::<HashSet<HubContact>>();
+                    uniq_contacts.extend(input);
                 },
                 Ok(Err(err)) => {
                     info!("Error found on finding unique contacts: {:#}", err);
@@ -375,23 +404,30 @@ impl WatchServer {
         Ok(uniq_contacts)
     }
 
+    // Traverse peers first iterates through existing known hubs and queries their current peers
+    // It returns that set of unique hubs and queries each of their info endpoints to see if they
+    // are reachable
     async fn traverse_peers(
         metrics: Arc<Metrics>,
         unique_peers: Arc<RwLock<HubUniquePeers>>,
-        unavailable_peers: Arc<RwLock<UnavailableHubSet>>,
+        unreachable: Arc<RwLock<HashMap<BaseRpcConfig, String>>>
     ) -> eyre::Result<()> {
-        let unique_contacts = WatchServer::find_unique_contacts(Arc::clone(&metrics), Arc::clone(&unique_peers)).await?;
+        let unique_contacts = WatchServer::find_unique_contacts(Arc::clone(&metrics), Arc::clone(&unique_peers), Arc::clone(&unreachable)).await?;
         let total = unique_contacts.len();
 
-        let uniq = unique_contacts.iter().map(|entry| entry.clone()).choose_multiple(&mut rand::thread_rng(), 512);
+        // let uniq = unique_contacts.iter().map(|entry| entry.clone()).choose_multiple(&mut rand::thread_rng(), 512);
+        let uniq = unique_contacts;
+        info!("Unique contacts found: [{}]", total);
 
         let peer_handles: FuturesUnordered<JoinHandle<eyre::Result<_>>> = Default::default();
+        let semaphore = Arc::new(Semaphore::new(256));
         for contact in uniq {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let metrics = Arc::clone(&metrics);
 
             peer_handles.push(tokio::task::spawn(async move {
-                let timeout = Duration::from_secs(3);
-                tokio::select! {
+                let timeout = Duration::from_secs(5);
+                let result = tokio::select! {
                     result = async {
                         let (conf, endp) = BaseRpcConfig::from_contact_info(&contact.inner).await?;
                         let response = HubServiceClient::connect(endp)
@@ -406,9 +442,10 @@ impl WatchServer {
                             metrics.total_messages_histogram.observe(db_stats.num_messages as f64);
                         }
 
-                        Ok((conf, HubInfo {
+                        Ok((response.peer_id.clone(), HubInfo {
                             status: HubStatus::Available,
-                            hub_info: response.clone(),
+                            hub_info: response,
+                            rpc_config: conf,
                         }))
                     } => {
                         result
@@ -416,7 +453,9 @@ impl WatchServer {
                     _ = tokio::time::sleep(timeout) => {
                         Err(eyre!("Timeout waiting for response from peer"))
                     }
-                }
+                };
+                drop(permit);
+                result
             }))
         }
 
@@ -428,17 +467,17 @@ impl WatchServer {
         let mut output = vec![];
         for res in results {
             match res {
-                Ok(Ok((conf, info))) => {
-                    output.push((conf, info));
+                Ok(Ok((peer_id, info))) => {
+                    output.push((peer_id, info));
                     available.fetch_add(1, SeqCst);
-                },
+                }
                 Ok(Err(err)) => {
                     errors.push(err);
                     unavailable.fetch_add(1, SeqCst);
                 },
                 Err(err) => {
                     errors.push(Report::new(err));
-                    unavailable.fetch_add(1, SeqCst);
+                    // unavailable.fetch_add(1, SeqCst);
                 }
             }
         }
@@ -448,12 +487,13 @@ impl WatchServer {
 
         {
             unique_peers.write().await.extend(output);
+            let actual = unique_peers.read().await.len();
 
             let available = available.load(SeqCst);
             let unavailable = unavailable.load(SeqCst);
             let unknown = (total as u32) - available - unavailable;
-            info!("Updated contacts: [total: {}] [available: {}] [unavailable: {}] [unknown: {}]",
-                total, available, unavailable, unknown);
+            info!("Updated {} contacts: [total: {}] [available: {}] [unavailable: {}] [unknown: {}]",
+                actual, total, available, unavailable, unknown);
             metrics.total_hub_count.set(total as f64);
             metrics.available_hub_count.set(available as f64);
             metrics.unavailable_hub_count.set((unavailable + unknown) as f64);
@@ -471,12 +511,13 @@ enum HubStatus {
     Intermittent, // Intermittent connectivity issues
 }
 
-type HubUniquePeers = HashMap<BaseRpcConfig, HubInfo>;
+type HubUniquePeers = HashMap<String, HubInfo>;
 
 #[derive(Debug, Clone)]
 struct HubInfo {
     status: HubStatus,
     hub_info: HubInfoResponse,
+    rpc_config: BaseRpcConfig,
 }
 
 #[derive(Debug)]
@@ -485,9 +526,11 @@ struct Metrics {
     total_fid_events_histogram: prometheus::Histogram,
     total_fname_events_histogram: prometheus::Histogram,
     total_hub_count: prometheus::Gauge,
+    total_unique_endpoints: prometheus::Gauge,
     total_messages_histogram: prometheus::Histogram,
     unavailable_hub_count: prometheus::Gauge,
     available_hub_count: prometheus::Gauge,
+    peer_address_change_count: prometheus::Counter,
 }
 
 impl WatchCommand {
