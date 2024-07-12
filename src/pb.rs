@@ -94,7 +94,7 @@ pub struct MessageData {
     /// Farcaster network the message is intended for
     #[prost(enumeration = "FarcasterNetwork", tag = "4")]
     pub network: i32,
-    #[prost(oneof = "message_data::Body", tags = "5, 6, 7, 9, 10, 12, 14, 15, 16")]
+    #[prost(oneof = "message_data::Body", tags = "5, 6, 7, 9, 10, 12, 14, 15, 16, 17")]
     pub body: ::core::option::Option<message_data::Body>,
 }
 /// Nested message and enum types in `MessageData`.
@@ -123,6 +123,9 @@ pub mod message_data {
         UsernameProofBody(super::UserNameProof),
         #[prost(message, tag = "16")]
         FrameActionBody(super::FrameActionBody),
+        /// Compaction messages
+        #[prost(message, tag = "17")]
+        LinkCompactStateBody(super::LinkCompactStateBody),
     }
 }
 /// * Adds metadata about a user
@@ -176,6 +179,9 @@ pub struct CastAddBody {
     /// URLs or cast ids to be embedded in the cast
     #[prost(message, repeated, tag = "6")]
     pub embeds: ::prost::alloc::vec::Vec<Embed>,
+    /// Type of cast
+    #[prost(enumeration = "CastType", tag = "8")]
+    pub r#type: i32,
     #[prost(oneof = "cast_add_body::Parent", tags = "3, 7")]
     pub parent: ::core::option::Option<cast_add_body::Parent>,
 }
@@ -300,6 +306,17 @@ pub mod link_body {
         TargetFid(u64),
     }
 }
+/// * A Compaction message for the Link Store
+#[derive(serde::Serialize, serde::Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkCompactStateBody {
+    /// Type of link, <= 8 characters
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(uint64, repeated, tag = "2")]
+    pub target_fids: ::prost::alloc::vec::Vec<u64>,
+}
 /// * A Farcaster Frame action
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -421,6 +438,8 @@ pub enum MessageType {
     UsernameProof = 12,
     /// A Farcaster Frame action
     FrameAction = 13,
+    /// Link Compaction State Message
+    LinkCompactState = 14,
 }
 impl MessageType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -443,6 +462,7 @@ impl MessageType {
             MessageType::UserDataAdd => "MESSAGE_TYPE_USER_DATA_ADD",
             MessageType::UsernameProof => "MESSAGE_TYPE_USERNAME_PROOF",
             MessageType::FrameAction => "MESSAGE_TYPE_FRAME_ACTION",
+            MessageType::LinkCompactState => "MESSAGE_TYPE_LINK_COMPACT_STATE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -462,6 +482,7 @@ impl MessageType {
             "MESSAGE_TYPE_USER_DATA_ADD" => Some(Self::UserDataAdd),
             "MESSAGE_TYPE_USERNAME_PROOF" => Some(Self::UsernameProof),
             "MESSAGE_TYPE_FRAME_ACTION" => Some(Self::FrameAction),
+            "MESSAGE_TYPE_LINK_COMPACT_STATE" => Some(Self::LinkCompactState),
             _ => None,
         }
     }
@@ -544,6 +565,34 @@ impl UserDataType {
             "USER_DATA_TYPE_BIO" => Some(Self::Bio),
             "USER_DATA_TYPE_URL" => Some(Self::Url),
             "USER_DATA_TYPE_USERNAME" => Some(Self::Username),
+            _ => None,
+        }
+    }
+}
+/// * Type of cast
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CastType {
+    Cast = 0,
+    LongCast = 1,
+}
+impl CastType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            CastType::Cast => "CAST",
+            CastType::LongCast => "LONG_CAST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CAST" => Some(Self::Cast),
+            "LONG_CAST" => Some(Self::LongCast),
             _ => None,
         }
     }
@@ -719,6 +768,15 @@ pub mod network_latency_message {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MessageBundle {
+    #[prost(bytes = "vec", tag = "1")]
+    pub hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<Message>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GossipMessage {
     #[prost(string, repeated, tag = "4")]
     pub topics: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
@@ -729,7 +787,7 @@ pub struct GossipMessage {
     /// Farcaster epoch timestamp in seconds when this message was first created
     #[prost(uint32, tag = "8")]
     pub timestamp: u32,
-    #[prost(oneof = "gossip_message::Content", tags = "1, 3, 7")]
+    #[prost(oneof = "gossip_message::Content", tags = "1, 3, 7, 9")]
     pub content: ::core::option::Option<gossip_message::Content>,
 }
 /// Nested message and enum types in `GossipMessage`.
@@ -746,6 +804,8 @@ pub mod gossip_message {
         ContactInfoContent(super::ContactInfoContent),
         #[prost(message, tag = "7")]
         NetworkLatencyMessage(super::NetworkLatencyMessage),
+        #[prost(message, tag = "9")]
+        MessageBundle(super::MessageBundle),
     }
 }
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1143,6 +1203,10 @@ pub struct SubscribeRequest {
     pub event_types: ::prost::alloc::vec::Vec<i32>,
     #[prost(uint64, optional, tag = "2")]
     pub from_id: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub total_shards: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub shard_index: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1188,6 +1252,8 @@ pub struct DbStats {
     pub num_fid_events: u64,
     #[prost(uint64, tag = "3")]
     pub num_fname_events: u64,
+    #[prost(uint64, tag = "4")]
+    pub approx_size: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -2513,6 +2579,34 @@ pub mod hub_service_client {
                 .insert(GrpcMethod::new("HubService", "GetAllLinkMessagesByFid"));
             self.inner.unary(req, path, codec).await
         }
+        /// @http-api: none
+        pub async fn get_link_compact_state_message_by_fid(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FidRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::MessagesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/HubService/GetLinkCompactStateMessageByFid",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("HubService", "GetLinkCompactStateMessageByFid"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Sync Methods
         pub async fn get_info(
             &mut self,
@@ -2559,6 +2653,53 @@ pub mod hub_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("HubService", "GetCurrentPeers"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// @http-api: none
+        pub async fn stop_sync(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<
+            tonic::Response<super::SyncStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/HubService/StopSync");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("HubService", "StopSync"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// This is experimental, do not rely on this endpoint existing in the future
+        /// @http-api: none
+        pub async fn force_sync(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SyncStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SyncStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/HubService/ForceSync");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("HubService", "ForceSync"));
             self.inner.unary(req, path, codec).await
         }
         /// @http-api: none

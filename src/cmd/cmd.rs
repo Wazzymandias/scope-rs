@@ -12,6 +12,7 @@ use tokio::runtime::Runtime;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
 use crate::cmd::diff_cmd::DiffCommand;
+use crate::cmd::fid_cmd::FidCommand;
 use crate::cmd::info_cmd::InfoCommand;
 use crate::cmd::messages_cmd::MessagesCommand;
 use crate::cmd::parse_cmd::ParseCommand;
@@ -165,8 +166,9 @@ pub struct Command {
 
 #[derive(Parser, Debug)]
 pub enum SubCommands {
-    Info(InfoCommand),
     Diff(DiffCommand),
+    Fid(FidCommand),
+    Info(InfoCommand),
     Peers(PeersCommand),
     SyncMetadata(SyncMetadataCommand),
     SyncSnapshot(SyncSnapshotCommand),
@@ -229,8 +231,9 @@ impl Command {
     pub async fn execute(self) -> eyre::Result<()> {
         match &self.subcommand {
             Some(subcommand) => match subcommand {
-                SubCommands::Info(info) => info.execute().await?,
                 SubCommands::Diff(diff) => diff.execute().await?,
+                SubCommands::Fid(fid) => fid.execute().await?,
+                SubCommands::Info(info) => info.execute().await?,
                 SubCommands::Messages(messages) => messages.execute().await?,
                 SubCommands::Parse(parse) => parse.execute()?,
                 SubCommands::Peers(peers) => peers.execute().await?,
