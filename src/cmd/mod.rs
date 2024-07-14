@@ -9,3 +9,4 @@ mod sync_ids_cmd;
 mod watch_cmd;
 mod sync_metadata_cmd;
 mod fid_cmd;
+mod inspect_cmd;

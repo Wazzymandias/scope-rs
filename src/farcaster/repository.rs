@@ -50,10 +50,6 @@ COMMIT;
         })
     }
 
-    pub async fn cache_db(&self) -> &sled::Db {
-        &self.persistent_cache_db
-    }
-
     pub fn conn(&self) -> eyre::Result<duckdb::Connection> {
         self.db_conn.try_clone().map_err(|e| eyre::eyre!("Error cloning duckdb connection: {:?}", e))
     }
@@ -77,7 +73,7 @@ COMMIT;
         Ok(tree)
     }
 
-    pub fn insert_sync_ids_with_source(self, source: String, sync_ids: SyncIds) -> eyre::Result<()> {
+    pub fn _insert_sync_ids_with_source(self, source: String, sync_ids: SyncIds) -> eyre::Result<()> {
         let mut insert_sync_id = self.db_conn.prepare("INSERT INTO sync_ids (timestamp_prefix, sync_id_type, data_bytes) VALUES (?, ?, ?)")?;
         let mut insert_source_sync_id = self.db_conn.prepare("INSERT INTO source_sync_ids (source, sync_id) VALUES (?, ?)")?;
 

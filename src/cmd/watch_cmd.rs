@@ -8,12 +8,9 @@ use std::hash::{Hash, Hasher};
 use std::process::exit;
 use std::string::ToString;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
-use futures::{FutureExt, TryFutureExt};
-use prometheus::core::Atomic;
-use slog::Drain;
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep};
@@ -27,7 +24,7 @@ use crate::signals::handle_signals;
 
 const MINIMUM_POLL_INTERVAL_MS: u32 = 5000;
 const CONCURRENCY_LIMIT: usize = 512;
-static SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(CONCURRENCY_LIMIT));
+static SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct HubContact {
@@ -105,7 +102,7 @@ pub struct WatchCommand {
     duration: Option<usize>,
 }
 
-struct WatchServer {
+struct HubObserver {
     notify: Arc<Notify>,
     semaphore: Arc<Semaphore>,
     metrics: Arc<Metrics>,
@@ -118,23 +115,24 @@ struct WatchServer {
     unreachable_peers: Arc<RwLock<HashMap<BaseRpcConfig, String>>>,
 }
 
-impl WatchServer {
+impl HubObserver {
     async fn new(notify: Arc<Notify>, poll_interval_ms: u32) -> eyre::Result<Self> {
+        SEMAPHORE.get_or_init(|| Semaphore::new(CONCURRENCY_LIMIT));
         if poll_interval_ms < MINIMUM_POLL_INTERVAL_MS {
             return Err(eyre!(format!(
                 "Poll interval must be at least {} ms",
                 MINIMUM_POLL_INTERVAL_MS
             )));
         }
-        let (registry, metrics) = WatchServer::initialize_metrics().await?;
+        let (registry, metrics) = HubObserver::initialize_metrics().await?;
 
-        Ok(WatchServer {
+        Ok(HubObserver {
             done: Arc::new(AtomicBool::new(false)),
             semaphore: Arc::new(Semaphore::new(1)),
             notify,
             metrics: Arc::new(metrics),
             metrics_registry: registry,
-            poll_interval_duration: Duration::from_millis(poll_interval_ms as u64),
+            poll_interval_duration: Duration::new((poll_interval_ms / 1000) as u64, (poll_interval_ms % 1000) * 1_000_000u32),
 
             unique_peers: Arc::new(RwLock::new(HubUniquePeers::new())),
             unreachable_peers: Arc::new(RwLock::new(HashMap::new())),
@@ -186,7 +184,7 @@ impl WatchServer {
                         // Scope to automatically release the permit after use
                         {
                             info!("Starting new scan of peers in the network", );
-                            WatchServer::traverse_peers(Arc::clone(&self.metrics), Arc::clone(&self.unique_peers), Arc::clone(&self.unreachable_peers)).await?;
+                            HubObserver::traverse_peers(Arc::clone(&self.metrics), Arc::clone(&self.unique_peers), Arc::clone(&self.unreachable_peers)).await?;
                         }
                     } else {
                         info!("Skipping tick as previous task is still running",);
@@ -346,7 +344,7 @@ impl WatchServer {
         let semaphore = Arc::new(Semaphore::new(256));
         for (peer_id, peer_info) in uniq.iter() {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let metrics = Arc::clone(&metrics);
+            let _metrics = Arc::clone(&metrics);
             let peer_id = peer_id.clone();
             let peer_info = peer_info.clone();
             let unreachable = Arc::clone(&unreachable);
@@ -412,7 +410,7 @@ impl WatchServer {
         unique_peers: Arc<RwLock<HubUniquePeers>>,
         unreachable: Arc<RwLock<HashMap<BaseRpcConfig, String>>>
     ) -> eyre::Result<()> {
-        let unique_contacts = WatchServer::find_unique_contacts(Arc::clone(&metrics), Arc::clone(&unique_peers), Arc::clone(&unreachable)).await?;
+        let unique_contacts = HubObserver::find_unique_contacts(Arc::clone(&metrics), Arc::clone(&unique_peers), Arc::clone(&unreachable)).await?;
         let total = unique_contacts.len();
 
         // let uniq = unique_contacts.iter().map(|entry| entry.clone()).choose_multiple(&mut rand::thread_rng(), 512);
@@ -536,7 +534,7 @@ struct Metrics {
 impl WatchCommand {
     pub async fn execute(&self) -> eyre::Result<()> {
         let notify = Arc::new(Notify::new());
-        let watch_server = WatchServer::new(Arc::clone(&notify), MINIMUM_POLL_INTERVAL_MS).await?;
+        let watch_server = HubObserver::new(Arc::clone(&notify), MINIMUM_POLL_INTERVAL_MS).await?;
 
         let notif = Arc::clone(&notify);
         tokio::task::spawn(async move {

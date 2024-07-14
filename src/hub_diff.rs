@@ -27,7 +27,6 @@ use crate::farcaster::DEFAULT_CACHE_DB_DIR;
 use crate::proto::hub_service_client::HubServiceClient;
 use crate::proto::{SyncIds, TrieNodePrefix};
 
-const PREFIX_SET_KEY: &[u8] = b"prefix_set";
 const DUCKDB_PATH: &str = ".duckdb";
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -357,7 +356,6 @@ impl HubStateDiffer {
         tree: Tree,
         sender: Sender<DbOperation>,
     ) -> eyre::Result<usize> {
-        let mut num_processed: usize = 0;
         let mut result_sync_ids: Vec<SyncIds> = vec![];
         let mut pending_item = PendingItem::new(pending);
         let mut cache_entries = vec![];
@@ -420,7 +418,7 @@ impl HubStateDiffer {
             pending_item.clear();
         }
 
-        num_processed = result_sync_ids.len();
+        let num_processed = result_sync_ids.len();
         if num_processed > 0 {
             sender
                 .send(DbOperation::BatchSyncIds {
@@ -568,7 +566,7 @@ impl HubStateDiffer {
             sender.clone(),
         ));
 
-        let result = futures::future::join(source_handle, target_handle).await;
+        let _ = futures::future::join(source_handle, target_handle).await;
         drop(sender);
         let _ = db_handle
             .join()

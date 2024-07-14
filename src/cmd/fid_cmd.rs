@@ -2,7 +2,7 @@ use clap::Args;
 use eyre::Report;
 use serde_json::{json, Value};
 use crate::cmd::cmd::BaseRpcConfig;
-use crate::proto::{FidRequest, Message, UserDataRequest, UserDataType};
+use crate::proto::{FidRequest, Message, UserDataRequest};
 use crate::proto::hub_service_client::HubServiceClient;
 
 #[derive(Args, Debug)]

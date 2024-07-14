@@ -1,6 +1,5 @@
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -14,13 +13,14 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use crate::cmd::diff_cmd::DiffCommand;
 use crate::cmd::fid_cmd::FidCommand;
 use crate::cmd::info_cmd::InfoCommand;
+use crate::cmd::inspect_cmd::InspectCommand;
 use crate::cmd::messages_cmd::MessagesCommand;
 use crate::cmd::parse_cmd::ParseCommand;
 use crate::cmd::peers_cmd::PeersCommand;
 use crate::cmd::sync_ids_cmd::SyncIdsCommand;
 use crate::cmd::sync_metadata_cmd::SyncMetadataCommand;
 use crate::cmd::watch_cmd::WatchCommand;
-use crate::proto::{ContactInfoContentBody, Message, TrieNodePrefix};
+use crate::proto::{ContactInfoContentBody, TrieNodePrefix};
 use crate::proto::hub_service_client::HubServiceClient;
 
 #[derive(Debug, Args, Clone)]
@@ -81,31 +81,31 @@ impl BaseRpcConfig {
             protocol, self.endpoint, self.port
         );
 
-        // if self.https {
-        //     Ok(Endpoint::from_str(endpoint.as_str())
-        //         .unwrap()
-        //         .keep_alive_while_idle(false)
-        //         .tcp_keepalive(None)
-        //         .tcp_nodelay(true)
-        //         // .tls_config(get_tls_config().clone())
-        //         // .unwrap()
-        //     )
-        // } else {
-        //     Ok(Endpoint::from_str(endpoint.as_str())
-        //         .unwrap()
-        //         .keep_alive_while_idle(false)
-        //         .tcp_keepalive(None)
-        //         .tcp_nodelay(true)
-        //     )
-        // }
-        Ok(Endpoint::from_str(endpoint.as_str())
-               .unwrap()
-               .keep_alive_while_idle(false)
-               .tcp_keepalive(None)
-               .tcp_nodelay(true)
-           // .tls_config(get_tls_config().clone())
-           // .unwrap()
-        )
+        if self.https {
+            Ok(Endpoint::from_str(endpoint.as_str())
+                .unwrap()
+                .keep_alive_while_idle(false)
+                .tcp_keepalive(None)
+                .tcp_nodelay(true)
+                .tls_config(get_tls_config().clone())
+                .unwrap()
+            )
+        } else {
+            Ok(Endpoint::from_str(endpoint.as_str())
+                .unwrap()
+                .keep_alive_while_idle(false)
+                .tcp_keepalive(None)
+                .tcp_nodelay(true)
+            )
+        }
+        // Ok(Endpoint::from_str(endpoint.as_str())
+        //        .unwrap()
+        //        .keep_alive_while_idle(false)
+        //        .tcp_keepalive(None)
+        //        .tcp_nodelay(true)
+        //    // .tls_config(get_tls_config().clone())
+        //    // .unwrap()
+        // )
     }
     pub async fn from_contact_info(contact_info: &ContactInfoContentBody) -> eyre::Result<(Self, Endpoint)> {
         match contact_info.rpc_address.as_ref() {
@@ -169,6 +169,7 @@ pub enum SubCommands {
     Diff(DiffCommand),
     Fid(FidCommand),
     Info(InfoCommand),
+    Inspect(InspectCommand),
     Peers(PeersCommand),
     SyncMetadata(SyncMetadataCommand),
     SyncSnapshot(SyncSnapshotCommand),
@@ -234,6 +235,7 @@ impl Command {
                 SubCommands::Diff(diff) => diff.execute().await?,
                 SubCommands::Fid(fid) => fid.execute().await?,
                 SubCommands::Info(info) => info.execute().await?,
+                SubCommands::Inspect(inspect) => inspect.execute()?,
                 SubCommands::Messages(messages) => messages.execute().await?,
                 SubCommands::Parse(parse) => parse.execute()?,
                 SubCommands::Peers(peers) => peers.execute().await?,
@@ -273,20 +275,4 @@ impl SyncSnapshotCommand {
             Ok(())
         })
     }
-}
-
-pub(crate) fn save_to_file(
-    messages: &(Vec<Message>, Vec<Message>),
-    first_path: &str,
-    second_path: &str,
-) -> eyre::Result<()> {
-    let file1 = File::create(first_path)?;
-    let (a, b) = messages;
-    let writer1 = BufWriter::new(file1);
-    serde_json::to_writer(writer1, a)?;
-
-    let file2 = File::create(second_path)?;
-    let writer2 = BufWriter::new(file2);
-    serde_json::to_writer(writer2, b)?;
-    Ok(())
 }

@@ -299,7 +299,7 @@ pub struct LinkBody {
 pub mod link_body {
     #[derive(serde::Serialize, serde::Deserialize)]
     #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
     pub enum Target {
         /// The fid the link relates to
         #[prost(uint64, tag = "3")]
@@ -895,7 +895,7 @@ pub struct SignerEventBody {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct SignerMigratedEventBody {
     #[prost(uint32, tag = "1")]
     pub migrated_at: u32,
@@ -1153,7 +1153,7 @@ impl HubEventType {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ValidateOrRevokeJobState {
     /// The (Farcaster time epoch) timestamp where the last job started
     #[prost(uint32, tag = "1")]
@@ -1164,7 +1164,7 @@ pub struct ValidateOrRevokeJobState {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct HubState {
     ///   uint32 last_eth_block = 1; // Deprecated
     #[prost(uint64, tag = "2")]
@@ -1193,7 +1193,7 @@ pub struct UpdateNameRegistryEventExpiryJobPayload {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Empty {}
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1210,14 +1210,14 @@ pub struct SubscribeRequest {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct EventRequest {
     #[prost(uint64, tag = "1")]
     pub id: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct HubInfoRequest {
     #[prost(bool, tag = "1")]
     pub db_stats: bool,
@@ -1244,7 +1244,7 @@ pub struct HubInfoResponse {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct DbStats {
     #[prost(uint64, tag = "1")]
     pub num_messages: u64,
@@ -1470,7 +1470,7 @@ pub mod reactions_by_target_request {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct UserDataRequest {
     #[prost(uint64, tag = "1")]
     pub fid: u64,
@@ -1486,7 +1486,7 @@ pub struct NameRegistryEventRequest {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct RentRegistryEventsRequest {
     #[prost(uint64, tag = "1")]
     pub fid: u64,
@@ -1588,7 +1588,7 @@ pub struct LinkRequest {
 pub mod link_request {
     #[derive(serde::Serialize, serde::Deserialize)]
     #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
     pub enum Target {
         #[prost(uint64, tag = "3")]
         TargetFid(u64),
@@ -1628,7 +1628,7 @@ pub struct LinksByTargetRequest {
 pub mod links_by_target_request {
     #[derive(serde::Serialize, serde::Deserialize)]
     #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, Copy, PartialEq, ::prost::Oneof)]
     pub enum Target {
         #[prost(uint64, tag = "1")]
         TargetFid(u64),

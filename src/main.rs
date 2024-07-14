@@ -1,13 +1,9 @@
-#![feature(duration_constructors)]
-#![feature(new_uninit)]
-
 extern crate core;
 
 use clap::Parser;
 use slog::{Drain, Logger, o, PushFnValue, Record};
 use slog_async::Async;
 use slog_json::Json;
-use console_subscriber;
 
 use crate::cmd::cmd::Command;
 
@@ -19,7 +15,6 @@ mod cmd;
 mod db;
 mod farcaster;
 mod hub_diff;
-mod deque;
 mod signals;
 mod waitgroup;
 
@@ -39,7 +34,7 @@ fn create_logger() -> Logger {
 }
 
 fn main() {
-    console_subscriber::init();
+    let _ = 0;
     // Create the global logger
     let logger = create_logger();
     let _guard = slog_scope::set_global_logger(logger);
