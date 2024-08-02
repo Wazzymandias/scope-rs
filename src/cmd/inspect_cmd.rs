@@ -60,7 +60,7 @@ fn iterate_trie_db(db_path_prefix: String) -> eyre::Result<()> {
         .into_os_string()
         .into_string()
         .map_err(|e| eyre::eyre!("Error converting path to string: {:?}", e))?;
-    let db = Arc::new(TransactionDB::<MultiThreaded>::open(&Options::default(), &TransactionDBOptions::default(), &path)?);
+    let _db = Arc::new(TransactionDB::<MultiThreaded>::open(&Options::default(), &TransactionDBOptions::default(), &path)?);
 
     Ok(())
 }
